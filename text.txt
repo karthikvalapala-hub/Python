@@ -1,0 +1,127 @@
+import pyodbc
+
+# ==========================================
+# SQL SERVER CONNECTION
+# ==========================================
+
+SERVER = "YOUR_SERVER_NAME"
+DATABASE = "ReportServer"
+
+# Windows Authentication
+conn_str = f"""
+DRIVER={{ODBC Driver 17 for SQL Server}};
+SERVER={SERVER};
+DATABASE={DATABASE};
+Trusted_Connection=yes;
+"""
+
+# ==========================================
+# CONNECT TO SQL SERVER
+# ==========================================
+
+conn = pyodbc.connect(conn_str)
+cursor = conn.cursor()
+
+print("Connected to SQL Server")
+
+# ==========================================
+# CREATE TARGET TABLE (IF NOT EXISTS)
+# ==========================================
+
+create_table_sql = """
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.tables
+    WHERE name = 'Datasource_Credentials'
+)
+BEGIN
+    CREATE TABLE dbo.Datasource_Credentials
+    (
+        DSID UNIQUEIDENTIFIER,
+        ItemID UNIQUEIDENTIFIER,
+        Datasource_Name NVARCHAR(260),
+        UserName VARCHAR(MAX),
+        Password_Value VARCHAR(MAX),
+        Created_Date DATETIME DEFAULT GETDATE()
+    )
+END
+"""
+
+cursor.execute(create_table_sql)
+conn.commit()
+
+print("Target table checked/created")
+
+# ==========================================
+# READ DATA FROM dbo.DataSource
+# ==========================================
+
+select_sql = """
+SELECT
+    DSID,
+    ItemID,
+    Name,
+
+    -- Convert IMAGE datatype to VARCHAR
+    CAST(CAST(UserName AS VARBINARY(MAX)) AS VARCHAR(MAX)) AS UserNameText,
+
+    CAST(CAST(Password AS VARBINARY(MAX)) AS VARCHAR(MAX)) AS PasswordText
+
+FROM dbo.DataSource
+"""
+
+cursor.execute(select_sql)
+
+rows = cursor.fetchall()
+
+print(f"Found {len(rows)} rows")
+
+# ==========================================
+# INSERT INTO TARGET TABLE
+# ==========================================
+
+insert_sql = """
+INSERT INTO dbo.Datasource_Credentials
+(
+    DSID,
+    ItemID,
+    Datasource_Name,
+    UserName,
+    Password_Value
+)
+VALUES (?, ?, ?, ?, ?)
+"""
+
+insert_count = 0
+
+for row in rows:
+
+    dsid = row.DSID
+    itemid = row.ItemID
+    datasource_name = row.Name
+    username = row.UserNameText
+    password = row.PasswordText
+
+    cursor.execute(
+        insert_sql,
+        dsid,
+        itemid,
+        datasource_name,
+        username,
+        password
+    )
+
+    insert_count += 1
+
+conn.commit()
+
+print(f"{insert_count} rows inserted successfully")
+
+# ==========================================
+# CLOSE CONNECTION
+# ==========================================
+
+cursor.close()
+conn.close()
+
+print("Process completed successfully")
