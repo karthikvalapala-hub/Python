@@ -39,7 +39,18 @@ TARGET_ALIASES: Dict[str, List[str]] = {
     "DSID": ["Datasource_ID", "DataSource_ID"],
 }
 
-AUDIT_COLUMNS = {
+# Audit/date columns are handled dynamically because different RPT table versions
+# may use names like updated_date, Updated_Date, or Updated_Data.
+# The error you received was because the target table has NOT NULL column Updated_Data,
+# but the older script only looked for updated_date.
+AUDIT_COLUMN_ALIASES = {
+    "created_by": ["created_by", "Created_By", "CreatedBy", "Created_By_ID"],
+    "created_date": ["created_date", "Created_Date", "CreatedData", "Created_Data"],
+    "updated_by": ["updated_by", "Updated_By", "UpdatedBy", "Updated_By_ID"],
+    "updated_date": ["updated_date", "Updated_Date", "UpdatedData", "Updated_Data"],
+}
+
+AUDIT_EXPRESSIONS = {
     "created_by": "SYSTEM_USER",
     "created_date": "GETDATE()",
     "updated_by": "SYSTEM_USER",
@@ -193,10 +204,15 @@ def load_datasources(source_conn: pyodbc.Connection, target_conn: pyodbc.Connect
 
     audit_insert_cols = []
     audit_values = []
-    for audit_col, audit_expr in AUDIT_COLUMNS.items():
-        if audit_col in target_columns:
-            audit_insert_cols.append(audit_col)
-            audit_values.append(audit_expr)
+
+    # Add audit columns when they exist in the target table.
+    # Uses case/name aliases so NOT NULL columns such as Updated_Data are populated.
+    for audit_key, possible_names in AUDIT_COLUMN_ALIASES.items():
+        for possible_name in possible_names:
+            if possible_name in target_columns and possible_name not in audit_insert_cols:
+                audit_insert_cols.append(possible_name)
+                audit_values.append(AUDIT_EXPRESSIONS[audit_key])
+                break
 
     all_insert_cols = insert_cols + audit_insert_cols
     parameter_placeholders = ["?" for _ in insert_cols] + audit_values
