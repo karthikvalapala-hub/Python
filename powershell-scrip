@@ -1,0 +1,84 @@
+# get_ssrs_connection.ps1
+param(
+    [string]$ReportServerUrl,
+    [string]$DataSourcePath,
+    [string]$Mode = "single"  # single or all
+)
+
+Import-Module ReportingServicesTools -ErrorAction Stop
+
+if ($Mode -eq "single") {
+    $dataSource = Get-RsDataSource -Path $DataSourcePath -ReportServerUri $ReportServerUrl
+    $result = @{
+        Name = $dataSource.Name
+        Path = $DataSourcePath
+        ConnectionString = $dataSource.ConnectString
+        Extension = $dataSource.Extension
+    }
+    $result | ConvertTo-Json -Compress
+}
+else {
+    $dataSources = Get-RsCatalogItems -ReportServerUri $ReportServerUrl -ItemType 'DataSource'
+    $results = @()
+    foreach ($ds in $dataSources) {
+        $details = Get-RsDataSource -Path $ds.Path -ReportServerUri $ReportServerUrl
+        $results += @{
+            Name = $ds.Name
+            Path = $ds.Path
+            ConnectionString = $details.ConnectString
+            Extension = $details.Extension
+        }
+    }
+    $results | ConvertTo-Json -Compress
+}
+
+
+
+
+——-
+
+
+
+import subprocess
+import json
+import os
+
+def get_connection_string_using_script(report_server_url, datasource_path):
+    """
+    Execute an external PowerShell script file
+    """
+    
+    script_path = os.path.join(os.path.dirname(__file__), "get_ssrs_connection.ps1")
+    
+    cmd = [
+        "powershell",
+        "-ExecutionPolicy", "Bypass",
+        "-File", script_path,
+        "-ReportServerUrl", report_server_url,
+        "-DataSourcePath", datasource_path,
+        "-Mode", "single"
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            return data.get("ConnectionString")
+        else:
+            print(f"Error: {result.stderr}")
+            return None
+            
+    except Exception as e:
+        print(f"Exception: {e}")
+        return None
+
+# Usage
+conn_string = get_connection_string_using_script(
+    "http://YourReportServer/ReportServer",
+    "/Data Sources/MyDatabase"
