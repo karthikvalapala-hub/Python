@@ -1,0 +1,275 @@
+import getpass
+import sys
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
+
+import pyodbc
+
+
+# ---------------------------------------------------------------------
+# Update this mapping only if your target RPT_Datasources column names differ.
+# Left side  = source dbo.DataSource column
+# Right side = target dbo.RPT_Datasources column
+# ---------------------------------------------------------------------
+COLUMN_MAPPING: Dict[str, str] = {
+    "DSID": "DSID",
+    "ItemID": "ItemID",
+    "SubscriptionID": "SubscriptionID",
+    "Name": "Name",
+    "Extension": "Extension",
+    "Link": "Link",
+    "CredentialRetrieval": "CredentialRetrieval",
+    "Prompt": "Prompt",
+    "ConnectionString": "ConnectionString",
+    "OriginalConnectionString": "OriginalConnectionString",
+    "OriginalConnectStringExpressionBased": "OriginalConnectStringExpressionBased",
+    "UserName": "UserName",
+    "Password": "Password",
+    "Flags": "Flags",
+    "Version": "Version",
+}
+
+# If your target table uses friendly column names, add aliases here.
+# Example: source UserName can load into connection_username if that is your target column.
+TARGET_ALIASES: Dict[str, List[str]] = {
+    "ConnectionString": ["connection_string", "connection_string_text", "Connection_String"],
+    "UserName": ["connection_username", "Connection_UserName", "User_Name"],
+    "Password": ["connection_password", "Connection_Password"],
+    "Name": ["datasource_name", "Datasource_Name", "DataSourceName"],
+    "DSID": ["Datasource_ID", "DataSource_ID"],
+}
+
+AUDIT_COLUMNS = {
+    "created_by": "SYSTEM_USER",
+    "created_date": "GETDATE()",
+    "updated_by": "SYSTEM_USER",
+    "updated_date": "GETDATE()",
+}
+
+
+def get_connection_inputs(role: str) -> dict:
+    print(f"\nEnter {role} connection details")
+    server = input(f"{role} server name: ").strip()
+    database = input(f"{role} database name: ").strip()
+    auth_type = input(f"{role} authentication type (trusted/sql): ").strip().lower()
+
+    while auth_type not in ("trusted", "sql"):
+        print("Invalid authentication type. Enter 'trusted' or 'sql'.")
+        auth_type = input(f"{role} authentication type (trusted/sql): ").strip().lower()
+
+    username = ""
+    password = ""
+    if auth_type == "sql":
+        username = input(f"{role} SQL username: ").strip()
+        password = getpass.getpass(f"{role} SQL password: ")
+
+    return {
+        "server": server,
+        "database": database,
+        "auth_type": auth_type,
+        "username": username,
+        "password": password,
+    }
+
+
+def build_connection_string(cfg: dict) -> str:
+    base = (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        f"SERVER={cfg['server']};"
+        f"DATABASE={cfg['database']};"
+        "TrustServerCertificate=yes;"
+    )
+
+    if cfg["auth_type"] == "trusted":
+        return base + "Trusted_Connection=yes;"
+
+    return base + f"UID={cfg['username']};PWD={cfg['password']};"
+
+
+def connect(cfg: dict) -> pyodbc.Connection:
+    return pyodbc.connect(build_connection_string(cfg), autocommit=False)
+
+
+def get_existing_columns(cursor: pyodbc.Cursor, schema_name: str, table_name: str) -> List[str]:
+    sql = """
+        SELECT c.name
+        FROM sys.columns c
+        INNER JOIN sys.objects o ON c.object_id = o.object_id
+        INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+        WHERE s.name = ?
+          AND o.name = ?
+        ORDER BY c.column_id;
+    """
+    return [row[0] for row in cursor.execute(sql, schema_name, table_name).fetchall()]
+
+
+def choose_target_column(source_col: str, target_columns: List[str]) -> str | None:
+    direct_target = COLUMN_MAPPING.get(source_col)
+    candidates = []
+
+    if direct_target:
+        candidates.append(direct_target)
+
+    candidates.extend(TARGET_ALIASES.get(source_col, []))
+
+    for candidate in candidates:
+        if candidate in target_columns:
+            return candidate
+
+    return None
+
+
+def is_binary_like(value: Any) -> bool:
+    return isinstance(value, (bytes, bytearray, memoryview))
+
+
+def safe_decode(value: Any, source_col: str) -> Any:
+    """
+    Converts SQL Server binary/image values safely.
+    UserName and Password from SSRS are commonly encrypted/protected and cannot be decoded reliably.
+    """
+    if value is None:
+        return None
+
+    if not is_binary_like(value):
+        return value
+
+    raw = bytes(value)
+
+    if source_col in ("UserName", "Password"):
+        return "[ENCRYPTED]" if raw else None
+
+    # Try common text encodings for connection strings and expressions.
+    for encoding in ("utf-16le", "utf-8", "cp1252"):
+        try:
+            decoded = raw.decode(encoding).replace("\x00", "").strip()
+            if decoded:
+                return decoded
+        except UnicodeDecodeError:
+            pass
+
+    return "[BINARY]"
+
+
+def build_select_insert_columns(
+    source_columns: List[str], target_columns: List[str]
+) -> Tuple[List[str], List[str]]:
+    select_cols = []
+    insert_cols = []
+
+    for source_col in COLUMN_MAPPING.keys():
+        if source_col not in source_columns:
+            continue
+
+        target_col = choose_target_column(source_col, target_columns)
+        if target_col:
+            select_cols.append(source_col)
+            insert_cols.append(target_col)
+
+    if not select_cols:
+        raise ValueError("No matching columns found between dbo.DataSource and dbo.RPT_Datasources. Check COLUMN_MAPPING/TARGET_ALIASES.")
+
+    return select_cols, insert_cols
+
+
+def load_datasources(source_conn: pyodbc.Connection, target_conn: pyodbc.Connection, truncate_target: bool) -> int:
+    source_cursor = source_conn.cursor()
+    target_cursor = target_conn.cursor()
+
+    source_columns = get_existing_columns(source_cursor, "dbo", "DataSource")
+    target_columns = get_existing_columns(target_cursor, "dbo", "RPT_Datasources")
+
+    select_cols, insert_cols = build_select_insert_columns(source_columns, target_columns)
+
+    if truncate_target:
+        print("Truncating dbo.RPT_Datasources...")
+        target_cursor.execute("TRUNCATE TABLE dbo.RPT_Datasources;")
+        target_conn.commit()
+
+    source_sql = f"""
+        SELECT {', '.join('[' + c + ']' for c in select_cols)}
+        FROM dbo.DataSource;
+    """
+
+    audit_insert_cols = []
+    audit_values = []
+    for audit_col, audit_expr in AUDIT_COLUMNS.items():
+        if audit_col in target_columns:
+            audit_insert_cols.append(audit_col)
+            audit_values.append(audit_expr)
+
+    all_insert_cols = insert_cols + audit_insert_cols
+    parameter_placeholders = ["?" for _ in insert_cols] + audit_values
+
+    insert_sql = f"""
+        INSERT INTO dbo.RPT_Datasources
+        ({', '.join('[' + c + ']' for c in all_insert_cols)})
+        VALUES ({', '.join(parameter_placeholders)});
+    """
+
+    rows = source_cursor.execute(source_sql).fetchall()
+    print(f"Found {len(rows)} row(s) in dbo.DataSource.")
+
+    inserted = 0
+    try:
+        for row in rows:
+            values = []
+            for idx, source_col in enumerate(select_cols):
+                values.append(safe_decode(row[idx], source_col))
+
+            target_cursor.execute(insert_sql, tuple(values))
+            inserted += 1
+
+        target_conn.commit()
+        return inserted
+
+    except Exception:
+        target_conn.rollback()
+        raise
+
+
+def main() -> None:
+    print("SSRS DataSource Metadata Extract: dbo.DataSource â dbo.RPT_Datasources")
+
+    source_cfg = get_connection_inputs("SOURCE")
+    use_same_target = input("Use same server/database as TARGET? (y/n): ").strip().lower()
+
+    if use_same_target == "y":
+        target_cfg = source_cfg
+    else:
+        target_cfg = get_connection_inputs("TARGET")
+
+    truncate_input = input("Truncate dbo.RPT_Datasources before load? (y/n): ").strip().lower()
+    truncate_target = truncate_input == "y"
+
+    source_conn = None
+    target_conn = None
+
+    try:
+        start_time = datetime.now()
+        source_conn = connect(source_cfg)
+        target_conn = connect(target_cfg)
+
+        inserted = load_datasources(source_conn, target_conn, truncate_target)
+        end_time = datetime.now()
+
+        print("\nLoad completed successfully.")
+        print(f"Rows inserted into dbo.RPT_Datasources: {inserted}")
+        print(f"Start time: {start_time}")
+        print(f"End time:   {end_time}")
+
+    except Exception as ex:
+        print("\nLoad failed. Transaction rolled back.")
+        print(f"Error type: {type(ex).__name__}")
+        print(f"Error message: {ex}")
+        sys.exit(1)
+
+    finally:
+        if source_conn:
+            source_conn.close()
+        if target_conn:
+            target_conn.close()
+
+
+if __name__ == "__main__":
+    main()
