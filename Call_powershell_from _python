@@ -1,0 +1,126 @@
+import subprocess
+import json
+import pyodbc
+
+
+REPORT_SERVER_URL = "http://YourServer/ReportServer"
+DATASOURCE_FOLDER = "/"   # use "/" to scan all folders
+
+SQL_SERVER = "YourSqlServer"
+DATABASE = "YourDatabase"
+
+
+def run_powershell():
+    ps_script = f"""
+    $ReportServerUri = "{REPORT_SERVER_URL}"
+    $FolderPath = "{DATASOURCE_FOLDER}"
+
+    $proxy = New-WebServiceProxy `
+        -Uri "$ReportServerUri/ReportService2010.asmx?wsdl" `
+        -UseDefaultCredential
+
+    $items = $proxy.ListChildren($FolderPath, $true)
+
+    $results = @()
+
+    foreach ($item in $items) {{
+        if ($item.TypeName -eq "DataSource") {{
+
+            $ds = $proxy.GetDataSourceContents($item.Path)
+
+            $username = $null
+
+            if ($ds.UserName) {{
+                $username = $ds.UserName
+            }}
+
+            $results += [PSCustomObject]@{{
+                Datasource_Name = $item.Name
+                Datasource_Path = $item.Path
+                Connection_String = $ds.ConnectString
+                Connection_Username = $username
+                Extension = $ds.Extension
+                CredentialRetrieval = $ds.CredentialRetrieval.ToString()
+            }}
+        }}
+    }}
+
+    $results | ConvertTo-Json -Depth 5
+    """
+
+    result = subprocess.run(
+        ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise Exception(result.stderr)
+
+    return result.stdout
+
+
+def get_sql_connection():
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={DATABASE};"
+        f"Trusted_Connection=yes;"
+    )
+    return pyodbc.connect(conn_str)
+
+
+def update_rpt_datasources(datasources):
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    update_sql = """
+        UPDATE dbo.RPT_Datasources
+        SET
+            Connection_String = ?,
+            Connection_Username = ?,
+            Extension = ?,
+            CredentialRetrieval = ?,
+            Updated_By = SYSTEM_USER,
+            Updated_Date = GETDATE()
+        WHERE Datasource_Path = ?
+    """
+
+    updated_count = 0
+
+    for ds in datasources:
+        cursor.execute(
+            update_sql,
+            ds.get("Connection_String"),
+            ds.get("Connection_Username"),
+            ds.get("Extension"),
+            ds.get("CredentialRetrieval"),
+            ds.get("Datasource_Path")
+        )
+
+        updated_count += cursor.rowcount
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print(f"Updated rows: {updated_count}")
+
+
+def main():
+    output = run_powershell()
+
+    if not output.strip():
+        print("No datasource details returned from SSRS.")
+        return
+
+    data = json.loads(output)
+
+    if isinstance(data, dict):
+        data = [data]
+
+    update_rpt_datasources(data)
+
+
+if __name__ == "__main__":
+    main()
