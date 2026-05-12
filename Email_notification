@@ -1,0 +1,195 @@
+import pyodbc
+import csv
+import smtplib
+from datetime import datetime
+from email.message import EmailMessage
+import os
+
+
+# ==============================
+# SQL SERVER CONFIGURATION
+# ==============================
+SQL_SERVER = "YOUR_SERVER_NAME"
+SQL_DATABASE = "YOUR_DATABASE_NAME"
+
+# For Windows Authentication
+CONNECTION_STRING = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    f"SERVER={SQL_SERVER};"
+    f"DATABASE={SQL_DATABASE};"
+    "Trusted_Connection=yes;"
+)
+
+# For SQL Authentication, use this instead:
+# SQL_USERNAME = "your_username"
+# SQL_PASSWORD = "your_password"
+# CONNECTION_STRING = (
+#     "DRIVER={ODBC Driver 17 for SQL Server};"
+#     f"SERVER={SQL_SERVER};"
+#     f"DATABASE={SQL_DATABASE};"
+#     f"UID={SQL_USERNAME};"
+#     f"PWD={SQL_PASSWORD};"
+# )
+
+
+# ==============================
+# EMAIL CONFIGURATION
+# ==============================
+SMTP_SERVER = "smtp.office365.com"
+SMTP_PORT = 587
+
+EMAIL_FROM = "your_email@company.com"
+EMAIL_PASSWORD = "your_email_password_or_app_password"
+EMAIL_TO = ["recipient1@company.com", "recipient2@company.com"]
+
+EMAIL_SUBJECT = "RPT Tables Count Report"
+
+
+# ==============================
+# OUTPUT FILE
+# ==============================
+OUTPUT_FOLDER = r"C:\Temp"
+TODAY = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_FILE = os.path.join(OUTPUT_FOLDER, f"RPT_Table_Counts_{TODAY}.csv")
+
+
+def get_rpt_tables(cursor):
+    """
+    Get all tables where table name starts with RPT_
+    """
+    sql = """
+        SELECT 
+            TABLE_SCHEMA,
+            TABLE_NAME
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_TYPE = 'BASE TABLE'
+          AND TABLE_NAME LIKE 'RPT[_]%'
+        ORDER BY TABLE_SCHEMA, TABLE_NAME;
+    """
+
+    cursor.execute(sql)
+    return cursor.fetchall()
+
+
+def get_table_count(cursor, schema_name, table_name):
+    """
+    Get row count from each RPT table
+    """
+    sql = f"SELECT COUNT(*) FROM [{schema_name}].[{table_name}]"
+    cursor.execute(sql)
+    return cursor.fetchone()[0]
+
+
+def write_counts_to_file(results):
+    """
+    Save table count results into CSV file
+    """
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    with open(OUTPUT_FILE, mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+
+        writer.writerow([
+            "Server_Name",
+            "Database_Name",
+            "Schema_Name",
+            "Table_Name",
+            "Row_Count",
+            "Report_Generated_Date"
+        ])
+
+        for row in results:
+            writer.writerow(row)
+
+    print(f"File created successfully: {OUTPUT_FILE}")
+
+
+def send_email_with_attachment():
+    """
+    Send email notification with CSV file attached
+    """
+    msg = EmailMessage()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(EMAIL_TO)
+    msg["Subject"] = EMAIL_SUBJECT
+
+    body = """
+Hello,
+
+Please find attached the latest RPT tables count report.
+
+Thanks,
+Automated Python Notification
+"""
+
+    msg.set_content(body)
+
+    with open(OUTPUT_FILE, "rb") as file:
+        file_data = file.read()
+        file_name = os.path.basename(OUTPUT_FILE)
+
+    msg.add_attachment(
+        file_data,
+        maintype="application",
+        subtype="octet-stream",
+        filename=file_name
+    )
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+        smtp.starttls()
+        smtp.login(EMAIL_FROM, EMAIL_PASSWORD)
+        smtp.send_message(msg)
+
+    print("Email sent successfully.")
+
+
+def main():
+    results = []
+
+    try:
+        print("Connecting to SQL Server...")
+        conn = pyodbc.connect(CONNECTION_STRING)
+        cursor = conn.cursor()
+
+        print("Getting RPT tables...")
+        rpt_tables = get_rpt_tables(cursor)
+
+        if not rpt_tables:
+            print("No RPT tables found.")
+            return
+
+        print(f"Found {len(rpt_tables)} RPT table(s).")
+
+        for table in rpt_tables:
+            schema_name = table.TABLE_SCHEMA
+            table_name = table.TABLE_NAME
+
+            print(f"Counting table: {schema_name}.{table_name}")
+
+            row_count = get_table_count(cursor, schema_name, table_name)
+
+            results.append([
+                SQL_SERVER,
+                SQL_DATABASE,
+                schema_name,
+                table_name,
+                row_count,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ])
+
+        write_counts_to_file(results)
+
+        send_email_with_attachment()
+
+        cursor.close()
+        conn.close()
+
+        print("Process completed successfully.")
+
+    except Exception as e:
+        print("Error occurred:")
+        print(str(e))
+
+
+if __name__ == "__main__":
+    main()
