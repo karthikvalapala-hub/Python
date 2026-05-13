@@ -1,0 +1,63 @@
+import subprocess
+
+REPORT_SERVER_URL = "https://reports-internal-dev/ReportServer"
+
+ps_script = f'''
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+$ReportServerUri = "{REPORT_SERVER_URL}"
+$FolderPath = "/"
+
+Write-Host "Connecting to SSRS..."
+Write-Host $ReportServerUri
+
+try {{
+
+    $proxy = New-WebServiceProxy -Uri "$ReportServerUri/ReportService2010.asmx?wsdl" -UseDefaultCredential
+
+    Write-Host "Connected Successfully"
+
+    $items = $proxy.ListChildren($FolderPath, $true)
+
+    Write-Host "Items Count:" $items.Count
+
+    foreach ($item in $items) {{
+
+        Write-Host "--------------------------------"
+
+        Write-Host "Name:" $item.Name
+        Write-Host "Path:" $item.Path
+        Write-Host "Type:" $item.TypeName
+
+        if ($item.TypeName -like "*DataSource*") {{
+
+            Write-Host "FOUND DATASOURCE"
+
+            $ds = $proxy.GetDataSourceContents($item.Path)
+
+            Write-Host "Connection String:" $ds.ConnectString
+            Write-Host "Username:" $ds.UserName
+        }}
+    }}
+}}
+catch {{
+    Write-Host "ERROR OCCURRED"
+    Write-Host $_.Exception.Message
+
+    if ($_.Exception.InnerException) {{
+        Write-Host $_.Exception.InnerException.Message
+    }}
+}}
+'''
+
+result = subprocess.run(
+    ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+    capture_output=True,
+    text=True
+)
+
+print("STDOUT:")
+print(result.stdout)
+
+print("STDERR:")
+print(result.stderr)
