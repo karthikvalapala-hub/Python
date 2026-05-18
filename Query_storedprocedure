@@ -204,7 +204,13 @@ def extract_schema_objects(command_text):
                 \[?([\w]+)\]?
                 """,
 
-                entry,
+
+(?:\[?([A-Za-z_][\w]*)\]?\.)?
+\[?([A-Za-z_][\w]*)\]?
+\.
+\[?([A-Za-z_][\w]*)\]?
+
+entry,
 
                 flags=re.IGNORECASE | re.VERBOSE
             )
