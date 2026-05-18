@@ -1,4 +1,43 @@
 
+# ---------------------------------------------------------
+# Handle Oracle-style comma-separated FROM tables
+# Example:
+#
+# FROM table1 a,
+#      schema.table2 b,
+#      schema.table3 c
+# ---------------------------------------------------------
+
+from_blocks = re.findall(
+    r"\bfrom\b(.*?)(?:\bwhere\b|\bgroup\b|\border\b|\bhaving\b|$)",
+    sql_text,
+    flags=re.IGNORECASE | re.DOTALL
+)
+
+for block in from_blocks:
+
+    table_matches = re.findall(
+        r"(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+        block,
+        flags=re.IGNORECASE
+    )
+
+    for schema_name, object_name in table_matches:
+
+        schema_name = schema_name.strip()
+        object_name = object_name.strip()
+
+        # Ignore temp tables
+        if schema_name.startswith("#") or object_name.startswith("#"):
+            continue
+
+        # Ignore CTE aliases
+        if object_name.lower() in cte_names:
+            continue
+
+        found.add((schema_name, object_name))
+
+
 patterns = [
 
     # FROM / JOIN / APPLY
