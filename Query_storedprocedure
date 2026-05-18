@@ -1,38 +1,97 @@
-import re
+def extract_schema_objects(command_text):
 
-def extract_objects(query_text):
+    if not command_text:
+        return []
 
-    objects = []
+    sql_text = _normalize_sql_for_parsing(command_text)
+    cte_names = _extract_cte_names(sql_text)
 
-    # ----------------------------------------------------
-    # Existing table extraction logic
-    # ----------------------------------------------------
+    found = set()
 
-    ...
+    # ---------------------------------------------------------
+    # Existing SQL object extraction patterns
+    # ---------------------------------------------------------
+    patterns = [
 
-    # ----------------------------------------------------
+        # FROM / JOIN / APPLY
+        r"\b(?:from|join|apply|cross\s+apply|outer\s+apply)\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+        # UPDATE
+        r"\bupdate\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+        # INSERT
+        r"\binsert\s+into\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+        # MERGE
+        r"\bmerge(?:\s+into)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+        # DELETE
+        r"\bdelete\s+from\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+        # EXEC stored procedure
+        r"\bexec(?:ute)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?"
+    ]
+
+    # ---------------------------------------------------------
+    # Process standard SQL patterns
+    # ---------------------------------------------------------
+    for pattern in patterns:
+
+        matches = re.findall(pattern, sql_text, flags=re.IGNORECASE)
+
+        for schema_name, object_name in matches:
+
+            schema_name = schema_name.strip()
+            object_name = object_name.strip()
+
+            # Ignore temp tables
+            if schema_name.startswith("#") or object_name.startswith("#"):
+                continue
+
+            # Ignore CTE aliases
+            if object_name.lower() in cte_names:
+                continue
+
+            found.add((schema_name, object_name))
+
+    # ---------------------------------------------------------
+    # NEW:
     # Detect direct stored procedure notation
-    # Example:
-    # Laftrak.sales_person_details.person_report
-    # ----------------------------------------------------
+    #
+    # Examples:
+    #   Laftrak.sales_person_details.person_report
+    #   sales_person_details.person_report
+    # ---------------------------------------------------------
 
-    query_clean = query_text.strip()
+    sql_clean = sql_text.strip()
 
-    sp_pattern = r'^([\w]+)\.([\w]+)\.([\w]+)$'
+    # Remove trailing semicolon
+    sql_clean = sql_clean.rstrip(";")
 
-    sp_match = re.match(sp_pattern, query_clean)
+    direct_sp_patterns = [
 
-    if sp_match:
+        # database.schema.procedure
+        r"^(?:\[?([\w]+)\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?$"
+    ]
 
-        database_name = sp_match.group(1)
-        schema_name = sp_match.group(2)
-        procedure_name = sp_match.group(3)
+    for pattern in direct_sp_patterns:
 
-        objects.append({
-            "database_name": database_name,
-            "schema_name": schema_name,
-            "object_name": procedure_name,
-            "object_type": "STORED_PROCEDURE"
-        })
+        match = re.match(pattern, sql_clean, flags=re.IGNORECASE)
 
-    return objects
+        if match:
+
+            database_name = match.group(1)
+            schema_name = match.group(2)
+            object_name = match.group(3)
+
+            # Ignore temp objects
+            if schema_name.startswith("#") or object_name.startswith("#"):
+                continue
+
+            # Ignore CTE aliases
+            if object_name.lower() in cte_names:
+                continue
+
+            found.add((schema_name, object_name))
+
+    return sorted(found)
