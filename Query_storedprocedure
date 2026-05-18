@@ -1,107 +1,229 @@
 def extract_schema_objects(command_text):
 
     if not command_text:
-
         return []
 
     sql_text = _normalize_sql_for_parsing(command_text)
-
     cte_names = _extract_cte_names(sql_text)
 
     found = set()
 
+    # ---------------------------------------------------------
+    # Standard SQL object extraction patterns
+    # ---------------------------------------------------------
     patterns = [
 
-        ...
+        # FROM / JOIN / APPLY patterns
+        r"""
+        \b
+        (
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+            |cross\s+apply
+            |outer\s+apply
+        )
+        \s+
+        (?:\[?[\w]+\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        """,
 
+        # UPDATE
+        r"""
+        \bupdate\s+
+        (?:\[?[\w]+\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        """,
+
+        # INSERT INTO
+        r"""
+        \binsert\s+into\s+
+        (?:\[?[\w]+\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        """,
+
+        # MERGE
+        r"""
+        \bmerge(?:\s+into)?\s+
+        (?:\[?[\w]+\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        """,
+
+        # DELETE
+        r"""
+        \bdelete\s+from\s+
+        (?:\[?[\w]+\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        """,
+
+        # EXEC stored procedure
+        r"""
+        \bexec(?:ute)?\s+
+        (?:\[?[\w]+\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        """
     ]
 
-    # =====================================================
-
-    # EXISTING REGEX LOOP
-
-    # =====================================================
-
+    # ---------------------------------------------------------
+    # Process standard SQL patterns
+    # ---------------------------------------------------------
     for pattern in patterns:
 
         matches = re.findall(
-
             pattern,
-
             sql_text,
-
             flags=re.IGNORECASE | re.VERBOSE
-
         )
 
-        for schema_name, object_name in matches:
+        for match in matches:
 
-            schema_name = schema_name.strip()
+            # First regex contains keyword group
+            if len(match) == 3:
+                schema_name = match[1].strip()
+                object_name = match[2].strip()
 
-            object_name = object_name.strip()
-
-            if schema_name.startswith("#") or object_name.startswith("#"):
-
-                continue
-
-            if object_name.lower() in cte_names:
-
-                continue
-
-            found.add((schema_name, object_name))
-
-    # =====================================================
-
-    # ADD NEW BLOCK HERE
-
-    # =====================================================
-
-    from_blocks = re.findall(
-
-        r"\bfrom\b(.*?)(?:\bwhere\b|\bgroup\b|\border\b|\bhaving\b|$)",
-
-        sql_text,
-
-        flags=re.IGNORECASE | re.DOTALL
-
-    )
-
-    for block in from_blocks:
-
-        table_matches = re.findall(
-
-            r"(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-
-            block,
-
-            flags=re.IGNORECASE
-
-        )
-
-        for schema_name, object_name in table_matches:
-
-            schema_name = schema_name.strip()
-
-            object_name = object_name.strip()
+            else:
+                schema_name = match[0].strip()
+                object_name = match[1].strip()
 
             # Ignore temp tables
-
             if schema_name.startswith("#") or object_name.startswith("#"):
-
                 continue
 
             # Ignore CTE aliases
-
             if object_name.lower() in cte_names:
-
                 continue
 
             found.add((schema_name, object_name))
 
-    # =====================================================
+    # ---------------------------------------------------------
+    # Handle direct stored procedure notation
+    #
+    # Examples:
+    #   database.schema.proc_name
+    #   schema.proc_name
+    # ---------------------------------------------------------
+    sql_clean = sql_text.strip().rstrip(";")
 
-    # EXISTING RETURN
+    direct_sp_match = re.match(
 
-    # =====================================================
+        r"""
+        ^
+        (?:\[?([\w]+)\]?\.)?
+        \[?([\w]+)\]?
+        \.
+        \[?([\w]+)\]?
+        $
+        """,
 
-    return sorted(found
+        sql_clean,
+
+        flags=re.IGNORECASE | re.VERBOSE
+    )
+
+    if direct_sp_match:
+
+        database_name = direct_sp_match.group(1)
+        schema_name = direct_sp_match.group(2)
+        object_name = direct_sp_match.group(3)
+
+        if not (
+            schema_name.startswith("#")
+            or object_name.startswith("#")
+        ):
+
+            if object_name.lower() not in cte_names:
+
+                found.add((schema_name, object_name))
+
+    # ---------------------------------------------------------
+    # Handle Oracle-style comma-separated tables
+    #
+    # Example:
+    #
+    # FROM table1 a,
+    #      schema.table2 b,
+    #      schema.table3 c
+    # ---------------------------------------------------------
+
+    oracle_from_matches = re.findall(
+
+        r"""
+        from
+        \s+
+        (
+            .*?
+        )
+        (?=
+            \bwhere\b
+            |\bgroup\b
+            |\border\b
+            |\bhaving\b
+            |$
+        )
+        """,
+
+        sql_text,
+
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE
+    )
+
+    for from_block in oracle_from_matches:
+
+        # Split only comma-separated table entries
+        entries = from_block.split(",")
+
+        for entry in entries:
+
+            entry = entry.strip()
+
+            # Match only valid table declarations
+            match = re.match(
+
+                r"""
+                ^
+                (?:\[?([\w]+)\]?\.)?
+                \[?([\w]+)\]?
+                \.
+                \[?([\w]+)\]?
+                """,
+
+                entry,
+
+                flags=re.IGNORECASE | re.VERBOSE
+            )
+
+            if not match:
+                continue
+
+            database_name = match.group(1)
+            schema_name = match.group(2)
+            object_name = match.group(3)
+
+            # Ignore temp tables
+            if schema_name.startswith("#") or object_name.startswith("#"):
+                continue
+
+            # Ignore CTE aliases
+            if object_name.lower() in cte_names:
+                continue
+
+            found.add((schema_name, object_name))
+
+    return sorted(found)
