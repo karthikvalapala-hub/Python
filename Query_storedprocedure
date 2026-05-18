@@ -1,3 +1,45 @@
+
+patterns = [
+
+    # FROM / JOIN / APPLY
+    r"""
+    \b
+    (?:from
+    |join
+    |inner\s+join
+    |left\s+(?:outer\s+)?join
+    |right\s+(?:outer\s+)?join
+    |full\s+(?:outer\s+)?join
+    |cross\s+join
+    |cross\s+apply
+    |outer\s+apply
+    )
+    \s+
+    (?:\[?[\w]+\]?\.)?
+    \[?([\w]+)\]?
+    \.
+    \[?([\w]+)\]?
+    """,
+
+    # Oracle comma-separated tables
+    r",\s*(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+    # UPDATE
+    r"\bupdate\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+    # INSERT
+    r"\binsert\s+into\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+    # MERGE
+    r"\bmerge(?:\s+into)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+    # DELETE
+    r"\bdelete\s+from\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+    # EXEC stored procedure
+    r"\bexec(?:ute)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?"
+]
+
 def extract_schema_objects(command_text):
 
     if not command_text:
