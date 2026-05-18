@@ -1,0 +1,38 @@
+import re
+
+def extract_objects(query_text):
+
+    objects = []
+
+    # ----------------------------------------------------
+    # Existing table extraction logic
+    # ----------------------------------------------------
+
+    ...
+
+    # ----------------------------------------------------
+    # Detect direct stored procedure notation
+    # Example:
+    # Laftrak.sales_person_details.person_report
+    # ----------------------------------------------------
+
+    query_clean = query_text.strip()
+
+    sp_pattern = r'^([\w]+)\.([\w]+)\.([\w]+)$'
+
+    sp_match = re.match(sp_pattern, query_clean)
+
+    if sp_match:
+
+        database_name = sp_match.group(1)
+        schema_name = sp_match.group(2)
+        procedure_name = sp_match.group(3)
+
+        objects.append({
+            "database_name": database_name,
+            "schema_name": schema_name,
+            "object_name": procedure_name,
+            "object_type": "STORED_PROCEDURE"
+        })
+
+    return objects
