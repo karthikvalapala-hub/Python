@@ -1,22 +1,34 @@
-# Loads SSRS RDL metadata into repository tables and logs errors into dbo.RPT_Error_Log
-# Error log column names aligned to actual table structure.
-# Updated to better parse CTE-based SQL, bracketed identifiers, and 3-part object names.
-# Updated to resolve shared data sources from dbo.DataSource.Link -> dbo.Catalog.ItemID where Catalog.Type = 5.
-# Updated to populate DataSource_Type from either <Extension> or <DataProvider>.
-
 import pyodbc
 import xml.etree.ElementTree as ET
 import re
 import traceback
 from datetime import datetime
 
-SOURCE_SERVER = "Server1"
-SOURCE_DATABASE = "AdventureWorks2019"
+# ==============================
+# SQL SERVER ENVIRONMENT CONFIGURATION
+# ==============================
+
+ENVIRONMENT_CONFIG = {
+    "DEV": {
+        "SOURCES": [
+            {
+                "SOURCE_SERVER" : "DEVSQL1",
+                "SOURCE_DATABASE" : "Dev1",   
+            },
+            {
+                "SOURCE_SERVER" : "DEVSQL2",
+                "SOURCE_DATABASE" : "Dev2",     
+            }
+        ],
+        "TARGET_SERVER" : "Targetsql",
+        "TARGET_DATABASE" : "ReportRepo"
+        }
+	)
+    
+    
+# SOURCE AND TARGET TABLES
 SOURCE_TABLE = "dbo.Catalog"
 SOURCE_DATASOURCE_TABLE = "dbo.DataSource"
-
-TARGET_SERVER = "Server2"
-TARGET_DATABASE = "ReportMetaDataRepository"
 
 TARGET_RPT_CATALOG = "dbo.RPT_Catalog"
 TARGET_RPT_DATASOURCES = "dbo.RPT_DataSources"
@@ -29,10 +41,41 @@ TARGET_ERROR_LOG = "dbo.RPT_Error_Log"
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 LOAD_REPORTS_ONLY = True
 CLEAR_TARGET_TABLES_BEFORE_LOAD = False
-BUSINESS_SUITE_VALUE = "SSRS"
+BUSINESS_SUITE_VALUE = ""
 PROCESS_NAME = "SSRS_RDL_ETL_Load"
 
+# prompts user to enter environment details
+def get_environment_input():
+    allowed_envs = ", ".join(ENVIRONMENT_CONFIG.keys())
 
+    while True:
+        env_value = input(f"Enter environment ({allowed_envs}): ").strip().upper()
+
+        if env_value in ENVIRONMENT_CONFIG:
+            return env_value
+
+        print(f"Invalid environament: {env_value}")
+        print(f"Please enter one of: {allowed_envs}")
+
+# set Source and Target server and database details based on the selected environment
+def apply_environment_config(environment_name):
+    global SOURCES, SOURCE_DATABASE, TARGET_SERVER, TARGET_DATABASE
+
+    config = ENVIRONMENT_CONFIG[environment_name]
+    SOURCES = config["SOURCES"]
+    TARGET_SERVER = config["TARGET_SERVER"]
+    TARGET_DATABASE = config["TARGET_DATABASE"]
+
+    print("\nSelected environment configuration")
+    print("-" * 60)
+    print(f" Environment : {environment_name}")
+    print(f" Target Server : {TARGET_SERVER}")
+    print(f" Target Database : {TARGET_DATABASE}")
+
+    for source in SOURCES:
+        print(f" - {source['SOURCE_SERVER']} / {source['SOURCE_DATABASE']}")
+    print("-" * 60)
+    
 def get_connection(server_name: str, database_name: str) -> pyodbc.Connection:
     conn_str = (
         f"DRIVER={{{ODBC_DRIVER}}};"
@@ -113,7 +156,7 @@ def log_error_to_table(
 def fetch_catalog_rows(source_conn):
     where_clause = "WHERE Content IS NOT NULL"
     if LOAD_REPORTS_ONLY:
-        where_clause += " AND Type = 2"
+        where_clause += " AND Type in (2, 5)"
 
     sql = f"""
         SELECT
@@ -206,13 +249,21 @@ def extract_server_instance(connect_string):
 def extract_database_name(connect_string):
     if not connect_string:
         return None
-    match = re.search(
-        r"(?:Initial Catalog|Database)\s*=\s*([^;]+)",
-        connect_string,
-        flags=re.IGNORECASE
-    )
-    return match.group(1).strip() if match else None
 
+    patterns = [
+        r"Initial Catalog\s*=\s*([^;]+)",
+        r"Database\s*=\s*([^;]+)",
+        r"Catalog\s*=\s*([^;]+)",
+        r"DBQ\s*=\s*([^;]+)",
+        r"Service Name\s*=\s*([^;]+)",
+        r"SID\s*=\s*([^;]+)"
+        ]
+
+    for pattern in patterns:
+        match = re.search(pattern, connect_string, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()    
+    return None
 
 def parse_shared_datasource_content(content_bytes):
     """Parse dbo.Catalog.Content for Catalog.Type = 5 shared datasource rows."""
@@ -249,6 +300,14 @@ def parse_shared_datasource_content(content_bytes):
 
     result["server_instance"] = extract_server_instance(result["connection_string"])
     result["database_name"] = extract_database_name(result["connection_string"])
+
+    if (
+        result["datasource_type"]
+        and result["datasource_type"].upper() == "ORACLE"
+        and not result["database_name"]
+        ):
+        result["database_name"] = result["server_instance"]
+        
     return result
 
 
@@ -286,13 +345,32 @@ def fetch_shared_datasource_lookup(source_conn):
 
         lookup[(report_item_id, report_ds_name)] = {
             "datasource_name": row.SharedDataSourceName,
+            "datasource_name": (
+                row.SharedDataSourceName.upper()
+                if row.SharedDataSourceName
+                else None
+                ),
             "report_datasource_name": report_ds_name,
             "shared_datasource_path": row.SharedDataSourcePath,
             "shared_datasource_item_id": str(row.SharedDataSourceItemID).upper() if row.SharedDataSourceItemID else None,
-            "connection_string": parsed.get("connection_string"),
+            "connection_string": (
+                parsed.get("connection_string").upper()
+                if parsed.get("connection_string")
+                else None
+                ),
             "connection_username": parsed.get("connection_username"),
-            "server_instance": parsed.get("server_instance"),
-            "database_name": parsed.get("database_name"),
+            #"server_instance": parsed.get("server_instance"),
+            "server_instance": (
+                parsed.get("server_instance").upper()
+                if parsed.get("server_instance")
+                else None
+                ),
+            #"database_name": parsed.get("database_name"),
+            "database_name": (
+                parsed.get("database_name").upper()
+                if parsed.get("database_name")
+                else None
+                ),
             "datasource_type": parsed.get("datasource_type"),
             "datasource_reference": row.SharedDataSourcePath,
             "is_shared_datasource": 1
@@ -311,15 +389,24 @@ def apply_shared_datasource_values(report_item_id, datasources, shared_datasourc
         report_ds_name = ds.get("datasource_name")
         shared = shared_datasource_lookup.get((report_item_id, report_ds_name))
 
+        if not shared and report_ds_name:
+            shared = shared_datasource_lookup.get((report_item_id, report_ds_name.upper()))
+
         if shared:
             merged = dict(ds)
             merged.update(shared)
+
+            merged["datasource_name"] = shared.get("datasource_name")
+            merged["is_shared_datasource"] = 1
+            
             updated.append(merged)
             print(
                 f"  Resolved shared datasource: report DS '{report_ds_name}' "
                 f"-> shared DS '{shared.get('datasource_name')}'"
             )
         else:
+            ds["report_datasource_name"] = report_ds_name
+            ds["shared_datasource_name"] = None
             ds["datasource_type"] = ds.get("datasource_type")
             ds["is_shared_datasource"] = 0
             updated.append(ds)
@@ -369,44 +456,442 @@ def _extract_cte_names(sql_text):
         cte_names.add(name.lower())
     return cte_names
 
+def get_business_suite(rpt_path):
+    if not rpt_path:
+        return None
+
+    parts = rpt_path.strip("/").split("/")
+
+    if len(parts) > 0:
+        return parts[0].upper()
+
+    return None
 
 def extract_schema_objects(command_text):
     if not command_text:
         return []
 
     sql_text = _normalize_sql_for_parsing(command_text)
-    cte_names = _extract_cte_names(sql_text)
+
+    # Normalize CTE names to lowercase for consistent comparison
+    cte_names = {
+        name.lower()
+        for name in _extract_cte_names(sql_text)
+    }
+
     found = set()
 
+    # ---------------------------------------------------------
+    # Extract table aliases
+    #
+    # Examples:
+    #   FROM dbo.Customer AS A
+    #   FROM dbo.Customer A
+    #   JOIN sales.Orders AS B
+    #
+    # We keep these aliases only for filtering.
+    # They are NOT loaded into RPT_Objects.
+    # ---------------------------------------------------------
+
+    alias_names = set()
+
+    alias_pattern = r"""
+        \b
+        (?:
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+        )
+        \s+
+
+        # Optional database
+        (?:
+            \[?[A-Za-z_][\w$#]*\]?
+            \s*\.\s*
+        )?
+
+        # Schema
+        \[?[A-Za-z_][\w$#]*\]?
+        \s*\.\s*
+
+        # Object
+        \[?[A-Za-z_][\w$#]*\]?
+
+        # Optional AS
+        \s+
+        (?:AS\s+)?
+
+        # Alias
+        \[?([A-Za-z_][\w$#]*)\]?
+    """
+
+    sql_keywords = {
+        "where",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "outer",
+        "on",
+        "group",
+        "order",
+        "having",
+        "union",
+        "except",
+        "intersect",
+        "apply"
+    }
+
+    for alias_match in re.finditer(
+        alias_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+        alias_name = alias_match.group(1)
+
+        if alias_name:
+            alias_name = alias_name.strip("[] ").lower()
+
+            if alias_name not in sql_keywords:
+                alias_names.add(alias_name)
+
+    # ---------------------------------------------------------
+    # Existing SQL object extraction patterns
+    #
     # Supports:
     #   schema.object
     #   [schema].[object]
     #   database.schema.object
     #   [database].[schema].[object]
+    #
     # Captures schema + object only.
+    # ---------------------------------------------------------
+
     patterns = [
-        r"\b(?:from|join|apply|cross\s+apply|outer\s+apply)\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bupdate\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\binsert\s+into\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bmerge(?:\s+into)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bdelete\s+from\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bexec(?:ute)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?"
+
+        # FROM / JOIN / APPLY
+        r"""
+        \b
+        (
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+            |cross\s+apply
+            |outer\s+apply
+        )
+        \s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # UPDATE
+        r"""
+        \bupdate\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # INSERT INTO
+        r"""
+        \binsert\s+into\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # MERGE
+        r"""
+        \bmerge(?:\s+into)?\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # DELETE
+        r"""
+        \bdelete\s+from\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # EXEC / EXECUTE stored procedure
+        r"""
+        \bexec(?:ute)?\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """
     ]
 
+    # ---------------------------------------------------------
+    # Process standard SQL patterns
+    # ---------------------------------------------------------
+
     for pattern in patterns:
-        matches = re.findall(pattern, sql_text, flags=re.IGNORECASE)
-        for schema_name, object_name in matches:
-            schema_name = schema_name.strip()
-            object_name = object_name.strip()
 
-            if schema_name.startswith("#") or object_name.startswith("#"):
+        matches = re.findall(
+            pattern,
+            sql_text,
+            flags=re.IGNORECASE | re.VERBOSE
+        )
+
+        for match in matches:
+
+            # FROM/JOIN regex has keyword + schema + object
+            if len(match) == 3:
+                schema_name = match[1].strip("[] ")
+                object_name = match[2].strip("[] ")
+
+            else:
+                schema_name = match[0].strip("[] ")
+                object_name = match[1].strip("[] ")
+
+            schema_lower = schema_name.lower()
+            object_lower = object_name.lower()
+
+            # -------------------------------------------------
+            # Ignore temporary objects
+            # -------------------------------------------------
+
+            if (
+                schema_name.startswith("#")
+                or object_name.startswith("#")
+            ):
                 continue
 
-            # Avoid inserting references to CTE aliases as real objects.
-            if object_name.lower() in cte_names:
+            # -------------------------------------------------
+            # Ignore CTE names
+            # -------------------------------------------------
+
+            if (
+                schema_lower in cte_names
+                or object_lower in cte_names
+            ):
                 continue
 
-            found.add((schema_name, object_name))
+            # -------------------------------------------------
+            # IMPORTANT:
+            # Ignore alias.column references
+            #
+            # Example:
+            #   A.Customer_ID
+            #
+            # A is a table alias, not a schema.
+            # -------------------------------------------------
+
+            if schema_lower in alias_names:
+                continue
+
+            found.add(
+                (
+                    schema_name,
+                    object_name
+                )
+            )
+
+    # ---------------------------------------------------------
+    # Handle direct stored procedure notation
+    #
+    # Examples:
+    #
+    #   database.schema.proc_name
+    #   schema.proc_name
+    # ---------------------------------------------------------
+
+    sql_clean = sql_text.strip().rstrip(";")
+
+    direct_sp_match = re.match(
+
+        r"""
+        ^
+        (?:\[?([\w$#]+)\]?\.)?
+        \[?([\w$#]+)\]?
+        \.
+        \[?([\w$#]+)\]?
+        $
+        """,
+
+        sql_clean,
+
+        flags=re.IGNORECASE | re.VERBOSE
+    )
+
+    if direct_sp_match:
+
+        database_name = direct_sp_match.group(1)
+        schema_name = direct_sp_match.group(2)
+        object_name = direct_sp_match.group(3)
+
+        schema_name = schema_name.strip("[] ")
+        object_name = object_name.strip("[] ")
+
+        schema_lower = schema_name.lower()
+        object_lower = object_name.lower()
+
+        if not (
+            schema_name.startswith("#")
+            or object_name.startswith("#")
+        ):
+
+            if (
+                object_lower not in cte_names
+                and schema_lower not in cte_names
+                and schema_lower not in alias_names
+            ):
+
+                found.add(
+                    (
+                        schema_name,
+                        object_name
+                    )
+                )
+
+    # ---------------------------------------------------------
+    # Handle Oracle-style comma-separated tables
+    #
+    # Example:
+    #
+    # FROM schema.table1 A,
+    #      schema.table2 B,
+    #      schema.table3 C
+    #
+    # Only schema.table is retained.
+    # A / B / C are ignored.
+    # ---------------------------------------------------------
+
+    oracle_from_matches = re.findall(
+
+        r"""
+        \bfrom\b
+        \s+
+        (
+            .*?
+        )
+        (?=
+            \bwhere\b
+            |\bgroup\s+by\b
+            |\border\s+by\b
+            |\bhaving\b
+            |\bunion\b
+            |\bintersect\b
+            |\bexcept\b
+            |$
+        )
+        """,
+
+        sql_text,
+
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE
+    )
+
+    for from_block in oracle_from_matches:
+
+        # If block contains JOIN syntax, standard patterns above
+        # already handle it. Avoid over-parsing that block here.
+        if re.search(
+            r"\bjoin\b",
+            from_block,
+            flags=re.IGNORECASE
+        ):
+            continue
+
+        # Split Oracle comma-separated tables
+        entries = from_block.split(",")
+
+        for entry in entries:
+
+            entry = entry.strip()
+
+            # Ignore subquery / derived table
+            if entry.startswith("("):
+                continue
+
+            # Match:
+            #
+            #   schema.table alias
+            #   schema.table AS alias
+            #   database.schema.table alias
+            #
+            # Alias is deliberately NOT captured.
+            match = re.match(
+
+                r"""
+                ^
+                (?:
+                    \[?([A-Za-z_][\w$#]*)\]?
+                    \s*\.\s*
+                )?
+                \[?([A-Za-z_][\w$#]*)\]?
+                \s*\.\s*
+                \[?([A-Za-z_][\w$#]*)\]?
+                (?=
+                    \s
+                    |,
+                    |$
+                )
+                """,
+
+                entry,
+
+                flags=re.IGNORECASE | re.VERBOSE
+            )
+
+            if not match:
+                continue
+
+            database_name = match.group(1)
+            schema_name = match.group(2)
+            object_name = match.group(3)
+
+            schema_name = schema_name.strip("[] ")
+            object_name = object_name.strip("[] ")
+
+            schema_lower = schema_name.lower()
+            object_lower = object_name.lower()
+
+            # Ignore temp tables
+            if (
+                schema_name.startswith("#")
+                or object_name.startswith("#")
+            ):
+                continue
+
+            # Ignore CTEs
+            if (
+                schema_lower in cte_names
+                or object_lower in cte_names
+            ):
+                continue
+
+            # Ignore alias.column
+            if schema_lower in alias_names:
+                continue
+
+            found.add(
+                (
+                    schema_name,
+                    object_name
+                )
+            )
 
     return sorted(found)
 
@@ -452,7 +937,7 @@ def parse_rdl(xml_text):
             ds_ref_node = ds.find(ns_tag(namespace, "DataSourceReference"))
             datasource_reference = ds_ref_node.text.strip() if ds_ref_node is not None and ds_ref_node.text else None
 
-            datasource_map[ds_name] = {
+            datasource_map[ds_name.upper()] = {
                 "datasource_name": ds_name,
                 "connection_string": connect_string,
                 "connection_username": user_name,
@@ -478,6 +963,8 @@ def parse_rdl(xml_text):
 
                 if ds_node is not None and ds_node.text:
                     datasource_name = ds_node.text.strip()
+                else:
+                    raise ValueError(f"DataSourceName missing for dataset: {dataset_name}")
 
                 if ct_node is not None and ct_node.text:
                     command_text = ct_node.text.strip()
@@ -493,17 +980,15 @@ def parse_rdl(xml_text):
 
     for q in queries:
         dsn = q.get("datasource_name")
-        if dsn and dsn not in datasource_map:
-            datasources.append({
-                "datasource_name": dsn,
-                "connection_string": None,
-                "connection_username": None,
-                "server_instance": None,
-                "database_name": None,
-                "datasource_type": None,
-                "datasource_reference": None,
-                "is_shared_datasource": 0
-            })
+        if dsn:
+            dsn_key = dsn.upper()
+
+            if dsn_key not in datasource_map:
+                raise ValueError(
+                    f"Datasource could not be resolved for dataset: {q.get('dataset_name')}. "
+                    f"Dataset DataSourceName={dsn}. "
+                    f"Available datasources={[ds.get('datasource_name') for ds in datasources]}"
+                    )            
 
     seen = set()
     deduped = []
@@ -523,7 +1008,7 @@ def parse_rdl(xml_text):
 
     return deduped, queries
 
-
+""" Use this when we need to delete tables data instead of Truncating tables"""
 def clear_target_tables(target_conn):
     cursor = target_conn.cursor()
     print("Clearing target tables in dependency order...")
@@ -536,7 +1021,7 @@ def clear_target_tables(target_conn):
     print("Target tables cleared.")
 
 
-def insert_rpt_catalog(cursor, report_row):
+def insert_rpt_catalog(cursor, report_row, source_database):
     sql = f"""
         INSERT INTO {TARGET_RPT_CATALOG}
         (
@@ -544,20 +1029,22 @@ def insert_rpt_catalog(cursor, report_row):
             RPT_Type,
             RPT_Business_Suite,
             RPT_Path,
+            SSRS_Access_Method,
             Created_By,
             Created_Date,
             Updated_By,
             Updated_Date
         )
         OUTPUT INSERTED.RPT_ID
-        VALUES (?, ?, ?, ?, USER_NAME(), GETDATE(), USER_NAME(), GETDATE())
+        VALUES (?, ?, ?, ?, ?, USER_NAME(), GETDATE(), USER_NAME(), GETDATE())
     """
     cursor.execute(
         sql,
         report_row["report_name"],
         report_row["report_type"],
         report_row["business_suite"],
-        report_row["report_path"]
+        report_row["report_path"],
+        source_database
     )
     return cursor.fetchone()[0]
 
@@ -569,7 +1056,7 @@ def _first_existing_column(table_columns, *candidate_names):
     return None
 
 
-def get_or_create_datasource(cursor, ds_row, rpt_datasource_columns):
+def get_or_create_datasource(cursor, ds_row, rpt_datasource_columns, source_database):
     find_sql = f"""
         SELECT TOP 1 DataSource_ID
         FROM {TARGET_RPT_DATASOURCES}
@@ -606,7 +1093,7 @@ def get_or_create_datasource(cursor, ds_row, rpt_datasource_columns):
     # Load optional columns only if they exist in your target table.
     database_col = _first_existing_column(rpt_datasource_columns, "Database_Name")
     datasource_type_col = _first_existing_column(rpt_datasource_columns, "DataSource_Type", "Datasource_Type", "Extension")
-    shared_path_col = _first_existing_column(rpt_datasource_columns, "DataSource_Path", "Shared_DataSource_Path")
+    shared_path_col = _first_existing_column(rpt_datasource_columns, "DataSource_Path", "Shared_DataSource_Path")    
 
     if database_col:
         columns.append(database_col)
@@ -619,6 +1106,10 @@ def get_or_create_datasource(cursor, ds_row, rpt_datasource_columns):
     if shared_path_col:
         columns.append(shared_path_col)
         values.append(ds_row.get("shared_datasource_path"))
+
+    ssrs_access_method_col = _first_existing_column(rpt_datasource_columns, "SSRS_Access_Method")
+    if ssrs_access_method_col: columns.append(ssrs_access_method_col)
+    values.append(source_database)
 
     columns.extend(["Created_By", "Created_Date", "Updated_By", "Updated_Date"])
     column_text = ",\n            ".join(columns)
@@ -724,7 +1215,7 @@ def insert_rpt_servers(cursor):
     sql = f"""
         INSERT INTO {TARGET_RPT_SERVERS}
         (
-            Server_Name,
+            Server_Instance,
             Database_Name,
             Created_By,
             Created_Date,
@@ -746,14 +1237,14 @@ def insert_rpt_servers(cursor):
           AND NOT EXISTS (
               SELECT 1
               FROM {TARGET_RPT_SERVERS} s
-              WHERE ISNULL(s.Server_Name, '') = ISNULL(ds.Server_Instance, '')
+              WHERE ISNULL(s.Server_Instance, '') = ISNULL(ds.Server_Instance, '')
                 AND ISNULL(s.Database_Name, '') = ISNULL(o.Database_Name, '')
           )
     """
     cursor.execute(sql)
 
 
-def process_report(cursor, source_row, shared_datasource_lookup, rpt_datasource_columns):
+def process_report(cursor, source_row, shared_datasource_lookup, rpt_datasource_columns, source_database):
     report_name = source_row.Name
     report_type = str(source_row.Type) if source_row.Type is not None else None
     report_path = source_row.Path
@@ -771,11 +1262,11 @@ def process_report(cursor, source_row, shared_datasource_lookup, rpt_datasource_
     report_row = {
         "report_name": report_name,
         "report_type": report_type,
-        "business_suite": BUSINESS_SUITE_VALUE,
+        "business_suite": get_business_suite(report_path),
         "report_path": report_path
     }
 
-    rpt_id = insert_rpt_catalog(cursor, report_row)
+    rpt_id = insert_rpt_catalog(cursor, report_row, source_database)
     print(f"  Inserted RPT_Catalog row. RPT_ID = {rpt_id}")
 
     datasource_id_map = {}
@@ -786,7 +1277,7 @@ def process_report(cursor, source_row, shared_datasource_lookup, rpt_datasource_
     object_count = 0
 
     for ds in datasources:
-        datasource_id = get_or_create_datasource(cursor, ds, rpt_datasource_columns)
+        datasource_id = get_or_create_datasource(cursor, ds, rpt_datasource_columns, source_database)
         datasource_name = ds.get("datasource_name")
         datasource_id_map[datasource_name] = datasource_id
         datasource_info_map[datasource_name] = ds
@@ -837,7 +1328,6 @@ def process_report(cursor, source_row, shared_datasource_lookup, rpt_datasource_
         "objects": object_count
     }
 
-
 def main():
     source_conn = None
     target_conn = None
@@ -861,86 +1351,105 @@ def main():
         print("ETL started")
         print(f"Start time: {datetime.now()}")
 
-        print(f"Connecting to source: {SOURCE_SERVER} / {SOURCE_DATABASE}")
-        source_conn = get_connection(SOURCE_SERVER, SOURCE_DATABASE)
-        print("Connected to source.")
-
+        environment_name = get_environment_input()
+        apply_environment_config(environment_name)
+        
         print(f"Connecting to target: {TARGET_SERVER} / {TARGET_DATABASE}")
         target_conn = get_connection(TARGET_SERVER, TARGET_DATABASE)
         print("Connected to target.")
-
-        source_rows = fetch_catalog_rows(source_conn)
-        if not source_rows:
-            print("No source rows found. Nothing to load.")
-            return
-
-        shared_datasource_lookup = fetch_shared_datasource_lookup(source_conn)
-
+        
         if CLEAR_TARGET_TABLES_BEFORE_LOAD:
             clear_target_tables(target_conn)
 
         cursor = target_conn.cursor()
         rpt_datasource_columns = get_table_columns(cursor, TARGET_RPT_DATASOURCES)
 
-        for row in source_rows:
+        for source in SOURCES:
+            source_conn = None
+
+            SOURCE_SERVER = source["SOURCE_SERVER"]
+            SOURCE_DATABASE = source["SOURCE_DATABASE"]
+
             try:
-                counts = process_report(cursor, row, shared_datasource_lookup, rpt_datasource_columns)
+                print("\n" + "=" * 80)
+                print(f"Connecting to source: {SOURCE_SERVER} / {SOURCE_DATABASE}")
+                print("=" * 80)
+
+                source_conn = get_connection(SOURCE_SERVER, SOURCE_DATABASE)
+                print("Connected to source.")
+
+                source_rows = fetch_catalog_rows(source_conn)
+
+                if not source_rows:
+                    print("No source rows found. Nothing to load.")
+                    continue
+
+                shared_datasource_lookup = fetch_shared_datasource_lookup(source_conn)
+                 
+        
+                for row in source_rows:
+                    try:
+                        counts = process_report(cursor, row, shared_datasource_lookup, rpt_datasource_columns, SOURCE_DATABASE)
+                        target_conn.commit()
+
+                        total_catalog += counts["catalog"]
+                        total_datasources += counts["datasources"]
+                        total_maps += counts["maps"]
+                        total_queries += counts["queries"]
+                        total_objects += counts["objects"]
+
+                    except Exception as ex:
+                        target_conn.rollback()
+                        print(f"  Report failed and rolled back: {row.Path}")
+                        print_error(ex)
+
+                        log_error_to_table(
+                            target_conn=target_conn,
+                            process_name=PROCESS_NAME,
+                            source_table=SOURCE_TABLE,
+                            target_table=target_tables_text,
+                            report_path=getattr(row, "Path", None),
+                            report_name=getattr(row, "Name", None),
+                            error_type=type(ex).__name__,
+                            error_message=str(ex),
+                            error_details=traceback.format_exc()
+                        )
+            finally:
+                if source_conn:
+                    source_conn.close()
+                    print(f"Source connection closed: {SOURCE_SERVER} / {SOURCE_DATABASE}")
+
+            try:
+                print("\nInserting rows into dbo.RPT_Servers...")
+                insert_rpt_servers(cursor)
                 target_conn.commit()
-
-                total_catalog += counts["catalog"]
-                total_datasources += counts["datasources"]
-                total_maps += counts["maps"]
-                total_queries += counts["queries"]
-                total_objects += counts["objects"]
-
+                print("RPT_Servers load completed.")
             except Exception as ex:
                 target_conn.rollback()
-                print(f"  Report failed and rolled back: {row.Path}")
+                print("RPT_Servers load failed.")
                 print_error(ex)
-
                 log_error_to_table(
                     target_conn=target_conn,
                     process_name=PROCESS_NAME,
-                    source_table=SOURCE_TABLE,
-                    target_table=target_tables_text,
-                    report_path=getattr(row, "Path", None),
-                    report_name=getattr(row, "Name", None),
+                    source_table=f"{TARGET_RPT_DATASOURCES}, {TARGET_RPT_OBJECTS}",
+                    target_table=TARGET_RPT_SERVERS,
+                    report_path=None,
+                    report_name=None,
                     error_type=type(ex).__name__,
                     error_message=str(ex),
                     error_details=traceback.format_exc()
                 )
 
-        try:
-            print("\nInserting rows into dbo.RPT_Servers...")
-            insert_rpt_servers(cursor)
-            target_conn.commit()
-            print("RPT_Servers load completed.")
-        except Exception as ex:
-            target_conn.rollback()
-            print("RPT_Servers load failed.")
-            print_error(ex)
-            log_error_to_table(
-                target_conn=target_conn,
-                process_name=PROCESS_NAME,
-                source_table=f"{TARGET_RPT_DATASOURCES}, {TARGET_RPT_OBJECTS}",
-                target_table=TARGET_RPT_SERVERS,
-                report_path=None,
-                report_name=None,
-                error_type=type(ex).__name__,
-                error_message=str(ex),
-                error_details=traceback.format_exc()
-            )
-
-        print("\nLOAD SUMMARY")
-        print("-" * 60)
-        print(f"RPT_Catalog rows inserted       : {total_catalog}")
-        print(f"Datasource rows processed       : {total_datasources}")
-        print(f"Datasource map rows inserted    : {total_maps}")
-        print(f"Query rows inserted             : {total_queries}")
-        print(f"Object rows inserted            : {total_objects}")
-        print("-" * 60)
-        print(f"End time: {datetime.now()}")
-        print("ETL completed.")
+            print("\nLOAD SUMMARY")
+            print("-" * 60)
+            print(f"RPT_Catalog rows inserted       : {total_catalog}")
+            print(f"Datasource rows processed       : {total_datasources}")
+            print(f"Datasource map rows inserted    : {total_maps}")
+            print(f"Query rows inserted             : {total_queries}")
+            print(f"Object rows inserted            : {total_objects}")
+            print("-" * 60)
+            print(f"End time: {datetime.now()}")
+            print("ETL completed.")
 
     except Exception as ex:
         print("\nFatal error occurred.")
@@ -962,9 +1471,6 @@ def main():
                 pass
 
     finally:
-        if source_conn:
-            source_conn.close()
-            print("Source connection closed.")
         if target_conn:
             target_conn.close()
             print("Target connection closed.")
