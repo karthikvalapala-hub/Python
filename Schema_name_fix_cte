@@ -1,0 +1,44 @@
+# =========================================================
+# Collect aliases assigned to CTE names
+#
+# Examples:
+#
+# FROM TASK1 t1
+# FROM TASK2 t2
+# FROM TASK1 AS t1
+#
+# TASK1 / TASK2 are CTEs.
+# t1 / t2 are aliases and must NOT become schemas.
+# =========================================================
+
+if cte_names:
+
+    # Build regex dynamically from the CTE names
+    cte_pattern = "|".join(
+        re.escape(cte_name)
+        for cte_name in cte_names
+    )
+
+    cte_alias_pattern = rf"""
+        \b
+        (?:{cte_pattern})
+        \b
+        \s+
+        (?:AS\s+)?
+        \[?([A-Za-z_][\w$#]*)\]?
+    """
+
+    for alias_match in re.finditer(
+        cte_alias_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+
+        alias_name = alias_match.group(1)
+
+        if alias_name:
+
+            alias_name = alias_name.strip("[] ").lower()
+
+            if alias_name not in sql_keywords:
+                alias_names.add(alias_name)
