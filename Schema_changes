@@ -1,0 +1,632 @@
+def extract_schema_objects(command_text):
+    if not command_text:
+        return []
+
+    sql_text = _normalize_sql_for_parsing(command_text)
+
+    # Normalize CTE names for consistent comparison
+    cte_names = {
+        name.lower()
+        for name in _extract_cte_names(sql_text)
+    }
+
+    found = set()
+
+    # =========================================================
+    # 1. Collect table aliases
+    #
+    # Examples:
+    #   FROM dbo.Customer AS C
+    #   FROM dbo.Customer C
+    #   JOIN sales.Orders O
+    #
+    # These aliases are used only for filtering.
+    # They are NOT loaded into RPT_Objects.
+    # =========================================================
+
+    alias_names = set()
+
+    alias_pattern = r"""
+        \b
+        (?:
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+        )
+        \s+
+
+        # Optional database
+        (?:
+            \[?[A-Za-z_][\w$#]*\]?
+            \s*\.\s*
+        )?
+
+        # Schema
+        \[?[A-Za-z_][\w$#]*\]?
+        \s*\.\s*
+
+        # Object
+        \[?[A-Za-z_][\w$#]*\]?
+
+        # Optional AS
+        \s+
+        (?:AS\s+)?
+
+        # Alias
+        \[?([A-Za-z_][\w$#]*)\]?
+    """
+
+    sql_keywords = {
+        "where",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "outer",
+        "on",
+        "group",
+        "order",
+        "having",
+        "union",
+        "except",
+        "intersect",
+        "apply"
+    }
+
+    for alias_match in re.finditer(
+        alias_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+        alias_name = alias_match.group(1)
+
+        if alias_name:
+            alias_name = alias_name.strip("[] ").lower()
+
+            if alias_name not in sql_keywords:
+                alias_names.add(alias_name)
+
+    # =========================================================
+    # 2. Collect derived-table / subquery aliases
+    #
+    # Examples:
+    #
+    # FROM (
+    #     SELECT ...
+    # ) xx
+    #
+    # LEFT JOIN (
+    #     SELECT ...
+    # ) yy
+    #
+    # FROM (
+    #     SELECT ...
+    # ) AS x
+    #
+    # xx / yy / x are aliases and should NOT become schemas.
+    # =========================================================
+
+    derived_alias_pattern = r"""
+        \)
+        \s*
+        (?:AS\s+)?
+        \[?([A-Za-z_][\w$#]*)\]?
+    """
+
+    for alias_match in re.finditer(
+        derived_alias_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+        alias_name = alias_match.group(1)
+
+        if alias_name:
+            alias_name = alias_name.strip("[] ").lower()
+
+            if alias_name not in sql_keywords:
+                alias_names.add(alias_name)
+
+    # =========================================================
+    # 3. Standard SQL database-object patterns
+    #
+    # Supports:
+    #
+    #   schema.object
+    #   [schema].[object]
+    #   database.schema.object
+    #   [database].[schema].[object]
+    #
+    # Captures schema + object only.
+    # =========================================================
+
+    patterns = [
+
+        # FROM / JOIN / APPLY
+        r"""
+        \b
+        (
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+            |cross\s+apply
+            |outer\s+apply
+        )
+        \s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # UPDATE
+        r"""
+        \bupdate\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # INSERT INTO
+        r"""
+        \binsert\s+into\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # MERGE
+        r"""
+        \bmerge(?:\s+into)?\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # DELETE
+        r"""
+        \bdelete\s+from\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # EXEC / EXECUTE stored procedure
+        r"""
+        \bexec(?:ute)?\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """
+    ]
+
+    # =========================================================
+    # 4. Process standard SQL patterns
+    # =========================================================
+
+    for pattern in patterns:
+
+        matches = re.findall(
+            pattern,
+            sql_text,
+            flags=re.IGNORECASE | re.VERBOSE
+        )
+
+        for match in matches:
+
+            # FROM/JOIN regex contains:
+            # keyword + schema + object
+            if len(match) == 3:
+                schema_name = match[1].strip("[] ")
+                object_name = match[2].strip("[] ")
+
+            else:
+                schema_name = match[0].strip("[] ")
+                object_name = match[1].strip("[] ")
+
+            schema_lower = schema_name.lower()
+            object_lower = object_name.lower()
+
+            # Ignore temporary objects
+            if (
+                schema_name.startswith("#")
+                or object_name.startswith("#")
+            ):
+                continue
+
+            # Ignore CTE references
+            if (
+                schema_lower in cte_names
+                or object_lower in cte_names
+            ):
+                continue
+
+            # Ignore alias.column references
+            #
+            # Example:
+            #   xx.abcid
+            #   yy.barcode
+            #   x.first_name
+            #
+            # xx / yy / x are aliases, not schemas.
+            if schema_lower in alias_names:
+                continue
+
+            found.add(
+                (
+                    schema_name,
+                    object_name
+                )
+            )
+
+    # =========================================================
+    # 5. Handle direct stored procedure notation
+    #
+    # Examples:
+    #
+    #   database.schema.proc_name
+    #   schema.proc_name
+    # =========================================================
+
+    sql_clean = sql_text.strip().rstrip(";")
+
+    direct_sp_match = re.match(
+        r"""
+        ^
+        (?:\[?([\w$#]+)\]?\.)?
+        \[?([\w$#]+)\]?
+        \.
+        \[?([\w$#]+)\]?
+        $
+        """,
+        sql_clean,
+        flags=re.IGNORECASE | re.VERBOSE
+    )
+
+    if direct_sp_match:
+
+        database_name = direct_sp_match.group(1)
+        schema_name = direct_sp_match.group(2)
+        object_name = direct_sp_match.group(3)
+
+        schema_name = schema_name.strip("[] ")
+        object_name = object_name.strip("[] ")
+
+        schema_lower = schema_name.lower()
+        object_lower = object_name.lower()
+
+        if not (
+            schema_name.startswith("#")
+            or object_name.startswith("#")
+        ):
+
+            if (
+                schema_lower not in cte_names
+                and object_lower not in cte_names
+                and schema_lower not in alias_names
+            ):
+                found.add(
+                    (
+                        schema_name,
+                        object_name
+                    )
+                )
+
+    # =========================================================
+    # 6. Parenthesis-aware Oracle FROM parsing
+    #
+    # Important:
+    #
+    # The old logic used:
+    #
+    #     from_block.split(",")
+    #
+    # which caused SELECT columns inside nested subqueries to
+    # be interpreted as tables.
+    #
+    # Example:
+    #
+    #   xx.abcid,
+    #   xx.barcode,
+    #   xx.last_name
+    #
+    # could incorrectly become:
+    #
+    #   Schema_Name = xx
+    #   Object_Name = abcid
+    #
+    # The new logic splits commas only at the current query level.
+    # =========================================================
+
+    def get_from_blocks(sql):
+        """
+        Find FROM blocks while respecting nested parentheses.
+        """
+
+        blocks = []
+
+        from_matches = re.finditer(
+            r"\bfrom\b",
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        for from_match in from_matches:
+
+            start = from_match.end()
+            i = start
+            depth = 0
+            in_string = False
+
+            while i < len(sql):
+
+                char = sql[i]
+
+                # ---------------------------------------------
+                # Handle SQL string literals
+                # ---------------------------------------------
+                if char == "'":
+
+                    # SQL escaped quote:
+                    # 'John''s'
+                    if (
+                        in_string
+                        and i + 1 < len(sql)
+                        and sql[i + 1] == "'"
+                    ):
+                        i += 2
+                        continue
+
+                    in_string = not in_string
+                    i += 1
+                    continue
+
+                if in_string:
+                    i += 1
+                    continue
+
+                # ---------------------------------------------
+                # Track nested parentheses
+                # ---------------------------------------------
+                if char == "(":
+                    depth += 1
+                    i += 1
+                    continue
+
+                if char == ")":
+
+                    # Closing parenthesis belonging to the
+                    # query that contains this FROM
+                    if depth == 0:
+                        break
+
+                    depth -= 1
+                    i += 1
+                    continue
+
+                # ---------------------------------------------
+                # Stop only at clauses at this same query level
+                # ---------------------------------------------
+                if depth == 0:
+
+                    remaining = sql[i:]
+
+                    clause_match = re.match(
+                        r"""
+                        \s*
+                        (
+                            where\b
+                            |group\s+by\b
+                            |order\s+by\b
+                            |having\b
+                            |union\b
+                            |intersect\b
+                            |except\b
+                            |inner\s+join\b
+                            |left\s+(?:outer\s+)?join\b
+                            |right\s+(?:outer\s+)?join\b
+                            |full\s+(?:outer\s+)?join\b
+                            |cross\s+join\b
+                            |cross\s+apply\b
+                            |outer\s+apply\b
+                            |join\b
+                        )
+                        """,
+                        remaining,
+                        flags=re.IGNORECASE | re.VERBOSE
+                    )
+
+                    if clause_match:
+                        break
+
+                i += 1
+
+            block = sql[start:i].strip()
+
+            if block:
+                blocks.append(block)
+
+        return blocks
+
+    def split_top_level_commas(text):
+        """
+        Split comma-separated FROM objects only when the comma
+        occurs outside nested parentheses.
+        """
+
+        entries = []
+        current = []
+        depth = 0
+        in_string = False
+        i = 0
+
+        while i < len(text):
+
+            char = text[i]
+
+            # ---------------------------------------------
+            # Handle SQL string literals
+            # ---------------------------------------------
+            if char == "'":
+
+                if (
+                    in_string
+                    and i + 1 < len(text)
+                    and text[i + 1] == "'"
+                ):
+                    current.append(char)
+                    current.append(text[i + 1])
+                    i += 2
+                    continue
+
+                in_string = not in_string
+                current.append(char)
+                i += 1
+                continue
+
+            if not in_string:
+
+                if char == "(":
+                    depth += 1
+
+                elif char == ")":
+                    depth = max(
+                        0,
+                        depth - 1
+                    )
+
+                elif char == "," and depth == 0:
+
+                    entry = "".join(current).strip()
+
+                    if entry:
+                        entries.append(entry)
+
+                    current = []
+                    i += 1
+                    continue
+
+            current.append(char)
+            i += 1
+
+        entry = "".join(current).strip()
+
+        if entry:
+            entries.append(entry)
+
+        return entries
+
+    oracle_from_matches = get_from_blocks(sql_text)
+
+    for from_block in oracle_from_matches:
+
+        entries = split_top_level_commas(
+            from_block
+        )
+
+        for entry in entries:
+
+            entry = entry.strip()
+
+            # ---------------------------------------------
+            # Ignore derived tables / subqueries
+            #
+            # Example:
+            #
+            # FROM (
+            #     SELECT ...
+            # ) xx
+            #
+            # xx is an alias, not a physical DB object.
+            # ---------------------------------------------
+
+            if entry.startswith("("):
+                continue
+
+            # ---------------------------------------------
+            # Match physical DB objects
+            #
+            # Supports:
+            #
+            #   schema.table
+            #   schema.table alias
+            #   schema.table AS alias
+            #
+            #   database.schema.table
+            #   database.schema.table alias
+            #
+            # Alias is intentionally ignored.
+            # ---------------------------------------------
+
+            match = re.match(
+                r"""
+                ^
+                (?:
+                    \[?([A-Za-z_][\w$#]*)\]?
+                    \s*\.\s*
+                )?
+                \[?([A-Za-z_][\w$#]*)\]?
+                \s*\.\s*
+                \[?([A-Za-z_][\w$#]*)\]?
+                (?=
+                    \s
+                    |$
+                )
+                """,
+                entry,
+                flags=re.IGNORECASE | re.VERBOSE
+            )
+
+            if not match:
+                continue
+
+            database_name = match.group(1)
+            schema_name = match.group(2)
+            object_name = match.group(3)
+
+            schema_name = schema_name.strip("[] ")
+            object_name = object_name.strip("[] ")
+
+            schema_lower = schema_name.lower()
+            object_lower = object_name.lower()
+
+            # Ignore temporary objects
+            if (
+                schema_name.startswith("#")
+                or object_name.startswith("#")
+            ):
+                continue
+
+            # Ignore CTE references
+            if (
+                schema_lower in cte_names
+                or object_lower in cte_names
+            ):
+                continue
+
+            # Ignore alias.column references
+            if schema_lower in alias_names:
+                continue
+
+            found.add(
+                (
+                    schema_name,
+                    object_name
+                )
+            )
+
+    return sorted(found)
