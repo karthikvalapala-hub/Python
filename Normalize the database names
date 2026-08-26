@@ -1,0 +1,84 @@
+def normalize_environment_values(cursor):
+
+    # ---------------------------------------------------------
+    # Update RPT_Datasources
+    # ---------------------------------------------------------
+    update_datasources_sql = """
+        UPDATE RPT_Datasources
+        SET
+            Connection_String_Text =
+                CASE
+                    WHEN Connection_String_Text LIKE '%DATA SOURCE=TST%'
+                    THEN REPLACE(
+                        Connection_String_Text,
+                        'DATA SOURCE=TST',
+                        'DATA SOURCE=PRD'
+                    )
+
+                    WHEN Connection_String_Text LIKE '%DATA SOURCE=STG%'
+                    THEN REPLACE(
+                        Connection_String_Text,
+                        'DATA SOURCE=STG',
+                        'DATA SOURCE=PRD'
+                    )
+
+                    ELSE Connection_String_Text
+                END,
+
+            Server_Instance =
+                CASE
+                    WHEN Server_Instance LIKE 'TST%'
+                      OR Server_Instance LIKE 'STG%'
+                    THEN STUFF(Server_Instance, 1, 3, 'PRD')
+                    ELSE Server_Instance
+                END,
+
+            Database_Name =
+                CASE
+                    WHEN Database_Name LIKE 'TST%'
+                      OR Database_Name LIKE 'STG%'
+                    THEN STUFF(Database_Name, 1, 3, 'PRD')
+                    ELSE Database_Name
+                END
+
+        WHERE
+               Connection_String_Text LIKE '%DATA SOURCE=TST%'
+            OR Connection_String_Text LIKE '%DATA SOURCE=STG%'
+            OR Server_Instance LIKE 'TST%'
+            OR Server_Instance LIKE 'STG%'
+            OR Database_Name LIKE 'TST%'
+            OR Database_Name LIKE 'STG%';
+    """
+
+    cursor.execute(update_datasources_sql)
+
+    print(
+        "RPT_Datasources environment values updated. "
+        f"Rows affected: {cursor.rowcount}"
+    )
+
+    # ---------------------------------------------------------
+    # Update RPT_Objects
+    # ---------------------------------------------------------
+    update_objects_sql = """
+        UPDATE RPT_Objects
+        SET
+            Database_Name =
+                CASE
+                    WHEN Database_Name LIKE 'TST%'
+                      OR Database_Name LIKE 'STG%'
+                    THEN STUFF(Database_Name, 1, 3, 'PRD')
+                    ELSE Database_Name
+                END
+
+        WHERE
+               Database_Name LIKE 'TST%'
+            OR Database_Name LIKE 'STG%';
+    """
+
+    cursor.execute(update_objects_sql)
+
+    print(
+        "RPT_Objects Database_Name updated. "
+        f"Rows affected: {cursor.rowcount}"
+    )
