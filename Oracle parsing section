@@ -1,0 +1,59 @@
+# -------------------------------------------------
+# Capture alias for one-part FROM objects / CTEs
+#
+# Examples:
+#
+#   TASK1 t1
+#   TASK2 t2
+#   TASK3 T3
+#   TASK2 AS t2
+#
+# This is important for CTE references because they
+# do not have schema.object notation.
+# -------------------------------------------------
+
+single_source_alias_match = re.match(
+    r"""
+    ^
+    \[?([A-Za-z_][\w$#]*)\]?
+    \s+
+    (?:AS\s+)?
+    \[?([A-Za-z_][\w$#]*)\]?
+    (?=
+        \s
+        |$
+    )
+    """,
+    entry,
+    flags=re.IGNORECASE | re.VERBOSE
+)
+
+if single_source_alias_match:
+
+    source_name = single_source_alias_match.group(1)
+    alias_name = single_source_alias_match.group(2)
+
+    source_lower = source_name.lower()
+    alias_lower = alias_name.lower()
+
+    # Avoid SQL keywords being treated as aliases
+    if alias_lower not in sql_keywords:
+
+        alias_names.add(alias_lower)
+
+        # If this is a CTE reference, it is not a
+        # physical database object.
+        if source_lower in cte_names:
+            continue
+
+
+# Final protection against alias.column being stored
+found = {
+    (schema_name, object_name)
+    for schema_name, object_name in found
+    if schema_name.lower() not in alias_names
+}
+
+return sorted(found)
+
+
