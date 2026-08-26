@@ -1,0 +1,67 @@
+# =========================================================
+# Handle unqualified SQL Server objects
+#
+# Examples:
+#
+# FROM product
+# FROM product p
+# FROM product AS p
+# JOIN customer c
+#
+# Default schema = dbo
+# =========================================================
+
+unqualified_pattern = r"""
+    \b
+    (
+        from
+        |join
+        |inner\s+join
+        |left\s+(?:outer\s+)?join
+        |right\s+(?:outer\s+)?join
+        |full\s+(?:outer\s+)?join
+        |cross\s+join
+    )
+    \s+
+    \[?([A-Za-z_][\w$#]*)\]?
+    (?=
+        \s
+        |$
+        |,
+    )
+"""
+
+for match in re.finditer(
+    unqualified_pattern,
+    sql_text,
+    flags=re.IGNORECASE | re.VERBOSE
+):
+
+    object_name = match.group(2).strip("[] ")
+    object_lower = object_name.lower()
+
+    # Ignore temp tables
+    if object_name.startswith("#"):
+        continue
+
+    # Ignore CTE names
+    if object_lower in cte_names:
+        continue
+
+    # Ignore SQL keywords
+    if object_lower in sql_keywords:
+        continue
+
+    # Ignore derived/subquery syntax
+    if object_name.startswith("("):
+        continue
+
+    # Default SQL Server schema
+    schema_name = "dbo"
+
+    found.add(
+        (
+            schema_name,
+            object_name
+        )
+    )
