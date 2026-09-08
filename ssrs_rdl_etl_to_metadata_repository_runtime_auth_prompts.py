@@ -1,20 +1,52 @@
-# Loads SSRS metadata into repository tables and logs errors into dbo.RPT_Error_Log
-# Final cleaned version:
-# - RPT_DataSources is loaded primarily from SSRS shared data sources (Catalog.Type = 5)
-# - Shared data source details come from dbo.DataSource joined on Catalog.ItemID = DataSource.ItemID
-# - Binary/image fields in dbo.DataSource are decoded safely
-# - Report rows still come from Catalog.Type = 2
-# - Report-to-datasource mapping uses DataSourceReference when available
-# - Query/object extraction supports CTE-based SQL
+# load meta data repo tables V15 
 
 import pyodbc
 import xml.etree.ElementTree as ET
 import re
 import traceback
 from datetime import datetime
-from getpass import getpass
 
-SOURCE_CATALOG_TABLE = "dbo.Catalog"
+# ==============================
+# SQL SERVER ENVIRONMENT CONFIGURATION
+# ==============================
+# Note: Add an extra esacpe character "\" in the Server name
+ENVIRONMENT_CONFIG = {
+    "DEV": {
+        "SOURCES": [
+            {
+                "SOURCE_SERVER" : "DEVSQL\\STSEA01",
+                "SOURCE_DATABASE" : "ReportServerDev",    
+            }
+        ],
+        "TARGET_SERVER" : "DEV436LQC\\SQL2019",
+        "TARGET_DATABASE" : "AdventureWorks2019"
+        },
+    
+    "TEST": {
+        "SOURCES": [
+            {
+                "SOURCE_SERVER" : "TESTSQL\\SBEA02",
+                "SOURCE_DATABASE" : "ReportServerTST",   
+            }
+        ],
+        "TARGET_SERVER" : "TST126LQC\\SQL2019",
+        "TARGET_DATABASE" : "ReportMetadataRepository"
+        },
+
+    "PROD": {
+        "SOURCES": [
+            {
+                "SOURCE_SERVER" : "PRDSQL\\SFALC02",
+                "SOURCE_DATABASE" : "ReportServerProd",   
+            }
+        ],
+        "TARGET_SERVER" : "PROD43YHS\\SQL2019",
+        "TARGET_DATABASE" : "ReportMetadataRepositoryPROD"
+        },
+    }
+
+# SOURCE AND TARGET TABLES
+SOURCE_TABLE = "dbo.Catalog"
 SOURCE_DATASOURCE_TABLE = "dbo.DataSource"
 
 TARGET_RPT_CATALOG = "dbo.RPT_Catalog"
@@ -26,72 +58,50 @@ TARGET_RPT_SERVERS = "dbo.RPT_Servers"
 TARGET_ERROR_LOG = "dbo.RPT_Error_Log"
 
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
+LOAD_REPORTS_ONLY = True
 CLEAR_TARGET_TABLES_BEFORE_LOAD = False
-BUSINESS_SUITE_VALUE = "SSRS"
+BUSINESS_SUITE_VALUE = ""
 PROCESS_NAME = "SSRS_RDL_ETL_Load"
 
-REPORT_TYPE = 2
-SHARED_DATASOURCE_TYPE = 5
+# prompts user to enter environment details
+def get_environment_input():
+    allowed_envs = ", ".join(ENVIRONMENT_CONFIG.keys())
 
+    while True:
+        env_value = input(f"Enter environment ({allowed_envs}): ").strip().upper()
 
-# =========================
-# Connection / error helpers
-# =========================
+        if env_value in ENVIRONMENT_CONFIG:
+            return env_value
 
-def get_connection_inputs(role):
-    print(f"\nEnter {role} connection details")
+        print(f"Invalid environament: {env_value}")
+        print(f"Please enter one of: {allowed_envs}")
 
-    server = ""
-    while not server:
-        server = input(f"{role} server name: ").strip()
-        if not server:
-            print("Server name cannot be blank.")
+# set Source and Target server and database details based on the selected environment
+def apply_environment_config(environment_name):
+    global SOURCES, SOURCE_DATABASE, TARGET_SERVER, TARGET_DATABASE
 
-    database = ""
-    while not database:
-        database = input(f"{role} database name: ").strip()
-        if not database:
-            print("Database name cannot be blank.")
+    config = ENVIRONMENT_CONFIG[environment_name]
+    SOURCES = config["SOURCES"]
+    TARGET_SERVER = config["TARGET_SERVER"]
+    TARGET_DATABASE = config["TARGET_DATABASE"]
 
-    auth_type = input(f"{role} authentication type (trusted/sql): ").strip().lower()
-    while auth_type not in ("trusted", "sql"):
-        print("Invalid authentication type. Enter 'trusted' or 'sql'.")
-        auth_type = input(f"{role} authentication type (trusted/sql): ").strip().lower()
+    print("\nSelected environment configuration")
+    print("-" * 60)
+    print(f" Environment : {environment_name}")
+    print(f" Target Server : {TARGET_SERVER}")
+    print(f" Target Database : {TARGET_DATABASE}")
 
-    username = ""
-    password = ""
-
-    if auth_type == "sql":
-        while not username:
-            username = input(f"{role} SQL username: ").strip()
-            if not username:
-                print("SQL username cannot be blank.")
-
-        while not password:
-            password = getpass(f"{role} SQL password: ")
-            if not password:
-                print("SQL password cannot be blank.")
-
-    return server, database, auth_type, username, password
-
-
-def get_connection(server_name: str, database_name: str, auth_type: str, username: str = "", password: str = "") -> pyodbc.Connection:
-    if auth_type == "trusted":
-        conn_str = (
-            f"DRIVER={{{ODBC_DRIVER}}};"
-            f"SERVER={server_name};"
-            f"DATABASE={database_name};"
-            f"Trusted_Connection=yes;"
-        )
-    else:
-        conn_str = (
-            f"DRIVER={{{ODBC_DRIVER}}};"
-            f"SERVER={server_name};"
-            f"DATABASE={database_name};"
-            f"UID={username};"
-            f"PWD={password};"
-        )
-
+    for source in SOURCES:
+        print(f" - {source['SOURCE_SERVER']} / {source['SOURCE_DATABASE']}")
+    print("-" * 60)
+    
+def get_connection(server_name: str, database_name: str) -> pyodbc.Connection:
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={server_name};"
+        f"DATABASE={database_name};"
+        f"Trusted_Connection=yes;"
+    )
     return pyodbc.connect(conn_str)
 
 
@@ -116,7 +126,7 @@ def log_error_to_table(
     report_name,
     error_type,
     error_message,
-    error_details,
+    error_details
 ):
     try:
         cursor = target_conn.cursor()
@@ -153,7 +163,7 @@ def log_error_to_table(
             report_name,
             error_type,
             error_message,
-            error_details,
+            error_details
         )
         target_conn.commit()
         print("  Error logged to dbo.RPT_Error_Log.")
@@ -162,11 +172,11 @@ def log_error_to_table(
         print(type(log_ex).__name__, str(log_ex))
 
 
-# =========================
-# Source reads
-# =========================
+def fetch_catalog_rows(source_conn):
+    where_clause = "WHERE Content IS NOT NULL"
+    if LOAD_REPORTS_ONLY:
+        where_clause += " AND Type in (2, 5)"
 
-def fetch_reports(source_conn):
     sql = f"""
         SELECT
             ItemID,
@@ -174,119 +184,65 @@ def fetch_reports(source_conn):
             Type,
             Path,
             Content
-        FROM {SOURCE_CATALOG_TABLE}
-        WHERE Content IS NOT NULL
-          AND Type = {REPORT_TYPE}
+        FROM {SOURCE_TABLE}
+        {where_clause}
         ORDER BY Path
     """
     cursor = source_conn.cursor()
-    print("Reading source report rows (Type = 2)...")
+    print("Reading source Catalog rows...")
     cursor.execute(sql)
     rows = cursor.fetchall()
-    print(f"Report rows fetched: {len(rows)}")
+    print(f"Source rows fetched: {len(rows)}")
     return rows
 
 
-def fetch_shared_datasources(source_conn):
-    sql = f"""
-        SELECT
-            c.ItemID,
-            c.Name,
-            c.Type,
-            c.Path,
-            c.Content,
-            ds.DSID,
-            ds.ItemID AS DS_ItemID,
-            ds.Extension,
-            ds.ConnectionString,
-            ds.OriginalConnectionString,
-            ds.UserName,
-            ds.Link,
-            ds.CredentialRetrieval,
-            ds.Flags,
-            ds.Version
-        FROM {SOURCE_CATALOG_TABLE} c
-        LEFT JOIN {SOURCE_DATASOURCE_TABLE} ds
-            ON c.ItemID = ds.ItemID
-        WHERE c.Type = {SHARED_DATASOURCE_TYPE}
-        ORDER BY c.Path
-    """
-    cursor = source_conn.cursor()
-    print("Reading shared datasource rows (Type = 5) from Catalog + DataSource...")
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    print(f"Shared datasource rows fetched: {len(rows)}")
-    return rows
-
-
-# =========================
-# Decoding / XML helpers
-# =========================
-
-def _to_bytes(value):
-    if value is None:
-        return None
-    if isinstance(value, memoryview):
-        return value.tobytes()
-    if isinstance(value, bytes):
-        return value
-    return None
-
-
-def decode_binary_text(value):
-    if value is None:
+def decode_rdl_content(content_bytes):
+    if content_bytes is None:
         return None
 
-    if isinstance(value, str):
-        return value.strip() or None
-
-    raw = _to_bytes(value)
-    if raw is None:
-        text = str(value).strip()
-        return text or None
-
-    for enc in ["utf-16", "utf-16-le", "utf-16-be", "utf-8", "latin-1"]:
-        try:
-            text = raw.decode(enc, errors="ignore").replace("\x00", "").strip()
-            if text:
-                return text
-        except Exception:
-            pass
-
-    return None
-
-
-def decode_xml_content(content_bytes):
-    raw = _to_bytes(content_bytes)
-    if raw is None:
-        if isinstance(content_bytes, str):
-            return clean_xml_text(content_bytes)
-        return None
+    if isinstance(content_bytes, memoryview):
+        content_bytes = content_bytes.tobytes()
 
     for enc in ["utf-8", "utf-16", "utf-16-le", "utf-16-be"]:
         try:
-            text = raw.decode(enc, errors="ignore")
-            text = clean_xml_text(text)
-            if text:
+            text = content_bytes.decode(enc)
+            if "<Report" in text or "<?xml" in text:
                 return text
         except Exception:
             pass
 
-    return None
-
-
-def clean_xml_text(xml_text):
-    if not xml_text:
+    try:
+        return content_bytes.decode("utf-8", errors="ignore")
+    except Exception:
         return None
 
-    text = xml_text.replace("\x00", "").strip()
-    text = text.lstrip("\ufeff").strip()
-    first_lt = text.find("<")
-    if first_lt > 0:
-        text = text[first_lt:]
-    if not text.startswith("<"):
+
+def decode_xml_content(content_bytes):
+    """Decode SSRS Catalog.Content for reports and shared datasource XML.
+
+    Some ReportServer databases store Catalog.Content as UTF-16 bytes.
+    Decoding it as UTF-8 can make the values look like unreadable/Chinese characters,
+    so this helper tries the common encodings and only returns text that looks like XML.
+    """
+    if content_bytes is None:
         return None
-    return text
+
+    if isinstance(content_bytes, memoryview):
+        content_bytes = content_bytes.tobytes()
+
+    for enc in ["utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-8"]:
+        try:
+            text = content_bytes.decode(enc)
+            text = text.strip("\ufeff").strip()
+            if text.startswith("<") or "<?xml" in text:
+                return text
+        except Exception:
+            pass
+
+    try:
+        return content_bytes.decode("utf-8", errors="ignore").strip("\ufeff").strip()
+    except Exception:
+        return None
 
 
 def get_namespace(root):
@@ -298,134 +254,275 @@ def ns_tag(namespace, tag_name):
     return f"{{{namespace}}}{tag_name}" if namespace else tag_name
 
 
-def node_text(parent, namespace, tag_name):
-    if parent is None:
+def extract_server_instance(connect_string):
+    if not connect_string:
         return None
-    node = parent.find(ns_tag(namespace, tag_name))
-    if node is not None and node.text:
-        value = node.text.strip()
-        return value or None
-    return None
+    match = re.search(
+        r"(?:Data Source|Server|Address|Addr|Network Address)\s*=\s*([^;]+)",
+        connect_string,
+        flags=re.IGNORECASE
+    )
+    return match.group(1).strip() if match else None
 
 
-# =========================
-# Connection string helpers
-# =========================
-
-def extract_connect_property(connect_string, property_names):
+def extract_database_name(connect_string):
     if not connect_string:
         return None
 
-    for prop in property_names:
-        match = re.search(
-            rf"(?:^|;)\s*{re.escape(prop)}\s*=\s*([^;]+)",
-            connect_string,
-            flags=re.IGNORECASE,
-        )
+    patterns = [
+        r"Initial Catalog\s*=\s*([^;]+)",
+        r"Database\s*=\s*([^;]+)",
+        r"Catalog\s*=\s*([^;]+)",
+        r"DBQ\s*=\s*([^;]+)",
+        r"Service Name\s*=\s*([^;]+)",
+        r"SID\s*=\s*([^;]+)"
+        ]
+
+    for pattern in patterns:
+        match = re.search(pattern, connect_string, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            return match.group(1).strip()    
     return None
 
+def parse_shared_datasource_content(content_bytes):
+    """Parse dbo.Catalog.Content for Catalog.Type = 5 shared datasource rows."""
+    result = {
+        "connection_string": None,
+        "connection_username": None,
+        "server_instance": None,
+        "database_name": None,
+        "datasource_type": None
+    }
 
-def extract_server_instance(connect_string):
-    return extract_connect_property(
-        connect_string,
-        ["Data Source", "Server", "Address", "Addr", "Network Address", "Host"],
-    )
+    xml_text = decode_xml_content(content_bytes)
+    if not xml_text:
+        return result
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return result
+
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1].lower()
+        value = elem.text.strip() if elem.text else None
+
+        if tag in ("connectstring", "connectionstring") and value:
+            result["connection_string"] = value
+        elif tag in ("username", "user_name") and value:
+            result["connection_username"] = value
+        elif tag in ("extension", "dataprovider") and value:
+            # SSRS XML may store provider as either <Extension> or <DataProvider>.
+            # Use the first available value to populate DataSource_Type.
+            if not result["datasource_type"]:
+                result["datasource_type"] = value
+
+    result["server_instance"] = extract_server_instance(result["connection_string"])
+    result["database_name"] = extract_database_name(result["connection_string"])
+
+    if (
+        result["datasource_type"]
+        and result["datasource_type"].upper() == "ORACLE"
+        and not result["database_name"]
+        ):
+        result["database_name"] = result["server_instance"]
+        
+    return result
 
 
-def extract_database_name(connect_string, datasource_type=None):
-    database_name = extract_connect_property(
-        connect_string,
-        ["Initial Catalog", "Database", "DBQ"],
-    )
-    if database_name:
-        return database_name
+def fetch_shared_datasource_lookup(source_conn):
+    """Build lookup by report ItemID + report datasource name.
 
-    ds_type = (datasource_type or "").strip().lower()
+    For normal report rows, dbo.Catalog.Type = 2 and Catalog.ItemID = DataSource.ItemID.
+    For shared datasource rows, DataSource.Link points to dbo.Catalog.ItemID where Catalog.Type = 5.
+    """
+    sql = f"""
+        SELECT
+            ds.ItemID AS ReportItemID,
+            ds.Name AS ReportDataSourceName,
+            ds.Link AS SharedDataSourceItemID,
+            shared_cat.Name AS SharedDataSourceName,
+            shared_cat.Path AS SharedDataSourcePath,
+            shared_cat.Content AS SharedDataSourceContent
+        FROM {SOURCE_DATASOURCE_TABLE} ds
+        INNER JOIN {SOURCE_TABLE} shared_cat
+            ON ds.Link = shared_cat.ItemID
+           AND shared_cat.Type = 5
+    """
 
-    if ds_type == "oracle":
-        return extract_connect_property(connect_string, ["Data Source", "Service Name"])
+    cursor = source_conn.cursor()
+    print("Reading shared datasource definitions from dbo.DataSource.Link -> dbo.Catalog.ItemID...")
+    cursor.execute(sql)
+    rows = cursor.fetchall()
 
-    if ds_type == "db2":
-        return extract_connect_property(
-            connect_string,
-            ["Database", "CurrentSchema", "DefaultSchema", "Data Source"],
+    lookup = {}
+    for row in rows:
+        parsed = parse_shared_datasource_content(row.SharedDataSourceContent)
+        report_item_id = str(row.ReportItemID).upper()
+        report_ds_name = row.ReportDataSourceName
+
+        lookup[(report_item_id, report_ds_name)] = {
+            "datasource_name": row.SharedDataSourceName,
+            "datasource_name": (
+                row.SharedDataSourceName.upper()
+                if row.SharedDataSourceName
+                else None
+                ),
+            "report_datasource_name": report_ds_name,
+            "shared_datasource_path": row.SharedDataSourcePath,
+            "shared_datasource_item_id": str(row.SharedDataSourceItemID).upper() if row.SharedDataSourceItemID else None,
+            "connection_string": (
+                parsed.get("connection_string").upper()
+                if parsed.get("connection_string")
+                else None
+                ),
+            "connection_username": parsed.get("connection_username"),
+            #"server_instance": parsed.get("server_instance"),
+            "server_instance": (
+                parsed.get("server_instance").upper()
+                if parsed.get("server_instance")
+                else None
+                ),
+            #"database_name": parsed.get("database_name"),
+            "database_name": (
+                parsed.get("database_name").upper()
+                if parsed.get("database_name")
+                else None
+                ),
+            "datasource_type": parsed.get("datasource_type"),
+            "datasource_reference": row.SharedDataSourcePath,
+            "is_shared_datasource": 1
+        }
+
+    print(f"Shared datasource links fetched: {len(lookup)}")
+    return lookup
+
+def fetch_catalog_type5_datasources(source_conn):
+    """Fetch all shared datasource definitions stored as dbo.Catalog.Type = 5.
+
+    Some ReportServer databases have datasource rows where dbo.DataSource.ItemID is the
+    same ItemID as the shared datasource row in dbo.Catalog. These rows may not be
+    returned by the report-level Link join, so this function loads them directly into
+    dbo.RPT_DataSources.
+
+    Join requested:
+        dbo.DataSource ds
+        INNER JOIN dbo.Catalog shared_cat
+            ON ds.ItemID = shared_cat.ItemID
+           AND shared_cat.Type = 5
+    """
+    sql = f"""
+        SELECT DISTINCT
+            ds.ItemID AS SharedDataSourceItemID,
+            ds.Name AS DataSourceTableName,
+            shared_cat.Name AS SharedDataSourceName,
+            shared_cat.Path AS SharedDataSourcePath,
+            shared_cat.Content AS SharedDataSourceContent
+        FROM {SOURCE_DATASOURCE_TABLE} ds
+        INNER JOIN {SOURCE_TABLE} shared_cat
+            ON ds.ItemID = shared_cat.ItemID
+           AND shared_cat.Type = 5
+    """
+
+    cursor = source_conn.cursor()
+    print("Reading standalone shared datasource definitions from dbo.DataSource.ItemID -> dbo.Catalog.ItemID...")
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+
+    datasources = []
+    for row in rows:
+        parsed = parse_shared_datasource_content(row.SharedDataSourceContent)
+
+        # Prefer dbo.Catalog.Name because this is the actual shared datasource object name.
+        datasource_name = row.SharedDataSourceName or row.DataSourceTableName
+
+        datasources.append({
+            "datasource_name": datasource_name,
+            "report_datasource_name": row.DataSourceTableName,
+            "shared_datasource_path": row.SharedDataSourcePath,
+            "shared_datasource_item_id": str(row.SharedDataSourceItemID).upper() if row.SharedDataSourceItemID else None,
+            "connection_string": parsed.get("connection_string"),
+            "connection_username": parsed.get("connection_username"),
+            "server_instance": parsed.get("server_instance"),
+            "database_name": parsed.get("database_name"),
+            "datasource_type": parsed.get("datasource_type"),
+            "datasource_reference": row.SharedDataSourcePath,
+            "is_shared_datasource": 1
+        })
+
+    print(f"Standalone Catalog.Type = 5 shared datasources fetched: {len(datasources)}")
+    return datasources
+
+
+def load_catalog_type5_datasources(cursor, type5_datasources, rpt_datasource_columns):
+    """Insert/get all Catalog.Type = 5 shared datasource rows into dbo.RPT_DataSources."""
+    processed_count = 0
+
+    for ds in type5_datasources:
+        datasource_id = get_or_create_datasource(cursor, ds, rpt_datasource_columns)
+        processed_count += 1
+        print(
+            f"  Loaded Catalog.Type=5 datasource: {ds.get('datasource_name')} "
+            f"-> DataSource_ID = {datasource_id}"
         )
 
-    if ds_type == "excel":
-        return extract_connect_property(connect_string, ["DBQ", "Data Source"])
-
-    if ds_type in {"sap", "sap hana"}:
-        return extract_connect_property(connect_string, ["Database", "System", "Data Source"])
-
-    return None
+    return processed_count
 
 
-def normalize_datasource_type(data_provider, connect_string=None):
-    provider = (data_provider or "").strip().lower()
-    conn = (connect_string or "").strip().lower()
 
-    if provider in {"sql", "sqlclient", "system.data.sqlclient", "sql server", "sqlserver"}:
-        return "SQL"
-    if provider in {"oracle", "oracleclient", "odp.net", "system.data.oracleclient", "oracle database"}:
-        return "Oracle"
-    if provider in {"db2", "ibmdb2", "ibm db2", "ibm.data.db2"}:
-        return "DB2"
-    if provider in {"excel", "microsoft excel"}:
-        return "Excel"
-    if provider in {"sapbw", "sap bw", "sap"}:
-        return "SAP"
-    if provider in {"saphana", "sap hana"}:
-        return "SAP HANA"
-    if provider == "xml":
-        return "XML"
-    if provider == "odbc":
-        if "oracle" in conn:
-            return "Oracle"
-        if "db2" in conn:
-            return "DB2"
-        if "excel" in conn or ".xls" in conn:
-            return "Excel"
-        if "sap" in conn:
-            return "SAP"
-        if "sql server" in conn or "initial catalog=" in conn:
-            return "SQL"
-        return "ODBC"
-    if provider in {"oledb", "ole db"}:
-        if "oracle" in conn:
-            return "Oracle"
-        if "db2" in conn:
-            return "DB2"
-        if "excel" in conn or "microsoft.ace.oledb" in conn or "jet.oledb" in conn:
-            return "Excel"
-        if "sql server" in conn or "sqloledb" in conn or "sqlncli" in conn:
-            return "SQL"
-        return "OLEDB"
+def apply_shared_datasource_values(report_item_id, datasources, shared_datasource_lookup):
+    """Replace report-level shared datasource placeholders with actual Catalog.Type=5 details."""
+    report_item_id = str(report_item_id).upper()
+    updated = []
 
-    if "initial catalog=" in conn or ("server=" in conn and "database=" in conn):
-        return "SQL"
-    if "oracle" in conn:
-        return "Oracle"
-    if "db2" in conn:
-        return "DB2"
-    if "excel" in conn or ".xlsx" in conn or ".xls" in conn:
-        return "Excel"
-    if "sap" in conn:
-        return "SAP"
+    for ds in datasources:
+        report_ds_name = ds.get("datasource_name")
+        shared = shared_datasource_lookup.get((report_item_id, report_ds_name))
+        
+        if shared:
+            merged = dict(ds)
+            merged.update(shared)
+            
+            updated.append(merged)
+            
+            print(
+                f"  Resolved shared datasource: report DS '{report_ds_name}' "
+                f"-> shared DS '{shared.get('datasource_name')}'"
+            )
+        else:            
+            ds["datasource_type"] = ds.get("datasource_type")
+            ds["is_shared_datasource"] = 0
+            updated.append(ds)
 
-    return data_provider or None
+    return updated
 
 
-# =========================
-# SQL parsing helpers
-# =========================
+def get_table_columns(cursor, table_name):
+    """Return target table column names so optional columns can be loaded only when they exist."""
+    schema_name, object_name = table_name.split(".", 1) if "." in table_name else ("dbo", table_name)
+    sql = """
+        SELECT c.name
+        FROM sys.columns c
+        JOIN sys.objects o ON c.object_id = o.object_id
+        JOIN sys.schemas s ON o.schema_id = s.schema_id
+        WHERE s.name = ?
+          AND o.name = ?
+    """
+    cursor.execute(sql, schema_name.replace("[", "").replace("]", ""), object_name.replace("[", "").replace("]", ""))
+    return {row[0].lower() for row in cursor.fetchall()}
+
 
 def _normalize_sql_for_parsing(command_text):
     if not command_text:
         return ""
+
+    # Remove single-line comments
     sql_text = re.sub(r"--.*?$", " ", command_text, flags=re.MULTILINE)
+
+    # Remove block comments
     sql_text = re.sub(r"/\*.*?\*/", " ", sql_text, flags=re.DOTALL)
+
+    # Normalize whitespace
     sql_text = re.sub(r"\s+", " ", sql_text).strip()
     return sql_text
 
@@ -435,115 +532,755 @@ def _extract_cte_names(sql_text):
     if not sql_text:
         return cte_names
 
-    for match in re.finditer(r"\bwith\s+([A-Za-z_][\w]*)\s+as\s*\(", sql_text, flags=re.IGNORECASE):
-        cte_names.add(match.group(1).lower())
-
-    for match in re.finditer(r",\s*([A-Za-z_][\w]*)\s+as\s*\(", sql_text, flags=re.IGNORECASE):
-        cte_names.add(match.group(1).lower())
-
+    # Capture CTE names in patterns like:
+    # WITH cte1 AS (...), cte2 AS (...)
+    matches = re.findall(r"\b(?:WITH|,)\s*\[?([A-Za-z_][\w]*)\]?\s+AS\s*\(", sql_text, flags=re.IGNORECASE)
+    for name in matches:
+        cte_names.add(name.lower())
     return cte_names
 
+def get_business_suite(rpt_path):
+    if not rpt_path:
+        return None
+
+    parts = rpt_path.strip("/").split("/")
+
+    if len(parts) > 0:
+        return parts[0].upper()
+
+    return None
 
 def extract_schema_objects(command_text):
     if not command_text:
         return []
 
     sql_text = _normalize_sql_for_parsing(command_text)
-    cte_names = _extract_cte_names(sql_text)
+
+    # Normalize CTE names for consistent comparison
+    cte_names = {
+        name.lower()
+        for name in _extract_cte_names(sql_text)
+    }
+
     found = set()
 
+    # =========================================================
+    # 1. Collect table aliases
+    #
+    # Examples:
+    #   FROM dbo.Customer AS C
+    #   FROM dbo.Customer C
+    #   JOIN sales.Orders O
+    #
+    # These aliases are used only for filtering.
+    # They are NOT loaded into RPT_Objects.
+    # =========================================================
+
+    alias_names = set()
+
+    alias_pattern = r"""
+        \b
+        (?:
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+        )
+        \s+
+
+        # Optional database
+        (?:
+            \[?[A-Za-z_][\w$#]*\]?
+            \s*\.\s*
+        )?
+
+        # Schema
+        \[?[A-Za-z_][\w$#]*\]?
+        \s*\.\s*
+
+        # Object
+        \[?[A-Za-z_][\w$#]*\]?
+
+        # Optional AS
+        \s+
+        (?:AS\s+)?
+
+        # Alias
+        \[?([A-Za-z_][\w$#]*)\]?
+    """
+
+    sql_keywords = {
+        "where",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "outer",
+        "on",
+        "group",
+        "order",
+        "having",
+        "union",
+        "except",
+        "intersect",
+        "apply"
+    }
+
+    for alias_match in re.finditer(
+        alias_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+        alias_name = alias_match.group(1)
+
+        if alias_name:
+            alias_name = alias_name.strip("[] ").lower()
+
+            if alias_name not in sql_keywords:
+                alias_names.add(alias_name)
+
+    # =========================================================
+    # 2. Collect derived-table / subquery aliases
+    #
+    # Examples:
+    #
+    # FROM (
+    #     SELECT ...
+    # ) xx
+    #
+    # LEFT JOIN (
+    #     SELECT ...
+    # ) yy
+    #
+    # FROM (
+    #     SELECT ...
+    # ) AS x
+    #
+    # xx / yy / x are aliases and should NOT become schemas.
+    # =========================================================
+
+    derived_alias_pattern = r"""
+        \)
+        \s*
+        (?:AS\s+)?
+        \[?([A-Za-z_][\w$#]*)\]?
+    """
+
+    for alias_match in re.finditer(
+        derived_alias_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+        alias_name = alias_match.group(1)
+
+        if alias_name:
+            alias_name = alias_name.strip("[] ").lower()
+
+            if alias_name not in sql_keywords:
+                alias_names.add(alias_name)
+
+    # =========================================================
+    # 3. Standard SQL database-object patterns
+    #
+    # Supports:
+    #
+    #   schema.object
+    #   [schema].[object]
+    #   database.schema.object
+    #   [database].[schema].[object]
+    #
+    # Captures schema + object only.
+    # =========================================================
+
     patterns = [
-        r"\b(?:from|join|apply|cross\s+apply|outer\s+apply)\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bupdate\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\binsert\s+into\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bmerge(?:\s+into)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bdelete\s+from\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
-        r"\bexec(?:ute)?\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?\.\[?([\w]+)\]?",
+
+        # FROM / JOIN / APPLY
+        r"""
+        \b
+        (
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+            |cross\s+apply
+            |outer\s+apply
+        )
+        \s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # UPDATE
+        r"""
+        \bupdate\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # INSERT INTO
+        r"""
+        \binsert\s+into\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # MERGE
+        r"""
+        \bmerge(?:\s+into)?\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # DELETE
+        r"""
+        \bdelete\s+from\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """,
+
+        # EXEC / EXECUTE stored procedure
+        r"""
+        \bexec(?:ute)?\s+
+        (?:\[?[\w$#]+\]?\s*\.\s*)?
+        \[?([\w$#]+)\]?
+        \s*\.\s*
+        \[?([\w$#]+)\]?
+        """
     ]
 
+    # =========================================================
+    # 4. Process standard SQL patterns
+    # =========================================================
+
     for pattern in patterns:
-        for schema_name, object_name in re.findall(pattern, sql_text, flags=re.IGNORECASE):
-            if schema_name.lower() in cte_names or object_name.lower() in cte_names:
+
+        matches = re.findall(
+            pattern,
+            sql_text,
+            flags=re.IGNORECASE | re.VERBOSE
+        )
+
+        for match in matches:
+
+            # FROM/JOIN regex contains:
+            # keyword + schema + object
+            if len(match) == 3:
+                schema_name = match[1].strip("[] ")
+                object_name = match[2].strip("[] ")
+
+            else:
+                schema_name = match[0].strip("[] ")
+                object_name = match[1].strip("[] ")
+
+            schema_lower = schema_name.lower()
+            object_lower = object_name.lower()
+
+            # Ignore temporary objects
+            if (
+                schema_name.startswith("#")
+                or object_name.startswith("#")
+            ):
                 continue
-            if not schema_name.startswith("#") and not object_name.startswith("#"):
-                found.add((schema_name, object_name))
+
+            # Ignore CTE references
+            if (
+                schema_lower in cte_names
+                or object_lower in cte_names
+            ):
+                continue
+
+            # Ignore alias.column references
+            #
+            # Example:
+            #   xx.abcid
+            #   yy.barcode
+            #   x.first_name
+            #
+            # xx / yy / x are aliases, not schemas.
+            if schema_lower in alias_names:
+                continue
+
+            found.add(
+                (
+                    schema_name,
+                    object_name
+                )
+            )
+
+    # =========================================================
+    # Handle unqualified SQL Server objects
+    # Default schema = dbo
+    # =========================================================
+
+    unqualified_pattern = r"""
+        \b
+        (
+            from
+            |join
+            |inner\s+join
+            |left\s+(?:outer\s+)?join
+            |right\s+(?:outer\s+)?join
+            |full\s+(?:outer\s+)?join
+            |cross\s+join
+        )
+        \s+
+        \[?([A-Za-z_][\w$#]*)\]?
+        (?=
+            \s
+            |$
+            |,
+        )
+    """
+
+    for match in re.finditer(
+        unqualified_pattern,
+        sql_text,
+        flags=re.IGNORECASE | re.VERBOSE
+    ):
+
+        object_name = match.group(2).strip("[] ")
+        object_lower = object_name.lower()
+
+        # Ignore temp tables
+        if object_name.startswith("#"):
+            continue
+
+        # Ignore CTE names
+        if object_lower in cte_names:
+            continue
+
+        # Ignore SQL keywords
+        if object_lower in sql_keywords:
+            continue
+
+        # Ignore derived/subquery syntax
+        if object_name.startswith("("):
+            continue
+
+        # Default SQL Server schema
+        schema_name = "dbo"
+
+        found.add(
+            (
+                schema_name,
+                object_name
+            )
+        )
+
+    # =========================================================
+    # 5. Handle direct stored procedure notation
+    #
+    # Examples:
+    #
+    #   database.schema.proc_name
+    #   schema.proc_name
+    # =========================================================
+
+    sql_clean = sql_text.strip().rstrip(";")
+
+    direct_sp_match = re.match(
+        r"""
+        ^
+        (?:\[?([\w$#]+)\]?\.)?
+        \[?([\w$#]+)\]?
+        \.
+        \[?([\w$#]+)\]?
+        $
+        """,
+        sql_clean,
+        flags=re.IGNORECASE | re.VERBOSE
+    )
+
+    if direct_sp_match:
+
+        database_name = direct_sp_match.group(1)
+        schema_name = direct_sp_match.group(2)
+        object_name = direct_sp_match.group(3)
+
+        schema_name = schema_name.strip("[] ")
+        object_name = object_name.strip("[] ")
+
+        schema_lower = schema_name.lower()
+        object_lower = object_name.lower()
+
+        if not (
+            schema_name.startswith("#")
+            or object_name.startswith("#")
+        ):
+
+            if (
+                schema_lower not in cte_names
+                and object_lower not in cte_names
+                and schema_lower not in alias_names
+            ):
+                found.add(
+                    (
+                        schema_name,
+                        object_name
+                    )
+                )
+
+    # =========================================================
+    # 6. Parenthesis-aware Oracle FROM parsing
+    #
+    # Important:
+    #
+    # The old logic used:
+    #
+    #     from_block.split(",")
+    #
+    # which caused SELECT columns inside nested subqueries to
+    # be interpreted as tables.
+    #
+    # Example:
+    #
+    #   xx.abcid,
+    #   xx.barcode,
+    #   xx.last_name
+    #
+    # could incorrectly become:
+    #
+    #   Schema_Name = xx
+    #   Object_Name = abcid
+    #
+    # The new logic splits commas only at the current query level.
+    # =========================================================
+
+    def get_from_blocks(sql):
+        """
+        Find FROM blocks while respecting nested parentheses.
+        """
+
+        blocks = []
+
+        from_matches = re.finditer(
+            r"\bfrom\b",
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        for from_match in from_matches:
+
+            start = from_match.end()
+            i = start
+            depth = 0
+            in_string = False
+
+            while i < len(sql):
+
+                char = sql[i]
+
+                # ---------------------------------------------
+                # Handle SQL string literals
+                # ---------------------------------------------
+                if char == "'":
+
+                    # SQL escaped quote:
+                    # 'John''s'
+                    if (
+                        in_string
+                        and i + 1 < len(sql)
+                        and sql[i + 1] == "'"
+                    ):
+                        i += 2
+                        continue
+
+                    in_string = not in_string
+                    i += 1
+                    continue
+
+                if in_string:
+                    i += 1
+                    continue
+
+                # ---------------------------------------------
+                # Track nested parentheses
+                # ---------------------------------------------
+                if char == "(":
+                    depth += 1
+                    i += 1
+                    continue
+
+                if char == ")":
+
+                    # Closing parenthesis belonging to the
+                    # query that contains this FROM
+                    if depth == 0:
+                        break
+
+                    depth -= 1
+                    i += 1
+                    continue
+
+                # ---------------------------------------------
+                # Stop only at clauses at this same query level
+                # ---------------------------------------------
+                if depth == 0:
+
+                    remaining = sql[i:]
+
+                    clause_match = re.match(
+                        r"""
+                        \s*
+                        (
+                            where\b
+                            |group\s+by\b
+                            |order\s+by\b
+                            |having\b
+                            |union\b
+                            |intersect\b
+                            |except\b
+                            |inner\s+join\b
+                            |left\s+(?:outer\s+)?join\b
+                            |right\s+(?:outer\s+)?join\b
+                            |full\s+(?:outer\s+)?join\b
+                            |cross\s+join\b
+                            |cross\s+apply\b
+                            |outer\s+apply\b
+                            |join\b
+                        )
+                        """,
+                        remaining,
+                        flags=re.IGNORECASE | re.VERBOSE
+                    )
+
+                    if clause_match:
+                        break
+
+                i += 1
+
+            block = sql[start:i].strip()
+
+            if block:
+                blocks.append(block)
+
+        return blocks
+
+    def split_top_level_commas(text):
+        """
+        Split comma-separated FROM objects only when the comma
+        occurs outside nested parentheses.
+        """
+
+        entries = []
+        current = []
+        depth = 0
+        in_string = False
+        i = 0
+
+        while i < len(text):
+
+            char = text[i]
+
+            # ---------------------------------------------
+            # Handle SQL string literals
+            # ---------------------------------------------
+            if char == "'":
+
+                if (
+                    in_string
+                    and i + 1 < len(text)
+                    and text[i + 1] == "'"
+                ):
+                    current.append(char)
+                    current.append(text[i + 1])
+                    i += 2
+                    continue
+
+                in_string = not in_string
+                current.append(char)
+                i += 1
+                continue
+
+            if not in_string:
+
+                if char == "(":
+                    depth += 1
+
+                elif char == ")":
+                    depth = max(
+                        0,
+                        depth - 1
+                    )
+
+                elif char == "," and depth == 0:
+
+                    entry = "".join(current).strip()
+
+                    if entry:
+                        entries.append(entry)
+
+                    current = []
+                    i += 1
+                    continue
+
+            current.append(char)
+            i += 1
+
+        entry = "".join(current).strip()
+
+        if entry:
+            entries.append(entry)
+
+        return entries
+
+    oracle_from_matches = get_from_blocks(sql_text)
+
+    for from_block in oracle_from_matches:
+
+        entries = split_top_level_commas(
+            from_block
+        )
+
+        for entry in entries:
+
+            entry = entry.strip()
+
+            single_source_alias_match = re.match(
+                r"""
+                ^
+                \[?([A-Za-z_][\w$#]*)\]?
+                \s+
+                (?:AS\s+)?
+                \[?([A-Za-z_][\w$#]*)\]?
+                (?=
+                    \s
+                    |$
+                )
+                """,
+                entry,
+                flags=re.IGNORECASE | re.VERBOSE
+            )
+
+            if single_source_alias_match:
+
+                source_name = single_source_alias_match.group(1)
+                alias_name = single_source_alias_match.group(2)
+
+                source_lower = source_name.lower()
+                alias_lower = alias_name.lower()
+
+                # Avoid SQL keywords being treated as aliases
+                if alias_lower not in sql_keywords:
+                    alias_names.add(alias_lower)
+
+                if source_lower in cte_names:
+                    continue
+
+
+            # ---------------------------------------------
+            # Ignore derived tables / subqueries
+            #
+            # Example:
+            #
+            # FROM (
+            #     SELECT ...
+            # ) xx
+            #
+            # xx is an alias, not a physical DB object.
+            # ---------------------------------------------
+
+            if entry.startswith("("):
+                continue
+
+            # ---------------------------------------------
+            # Match physical DB objects
+            #
+            # Supports:
+            #
+            #   schema.table
+            #   schema.table alias
+            #   schema.table AS alias
+            #
+            #   database.schema.table
+            #   database.schema.table alias
+            #
+            # Alias is intentionally ignored.
+            # ---------------------------------------------
+
+            match = re.match(
+                r"""
+                ^
+                (?:
+                    \[?([A-Za-z_][\w$#]*)\]?
+                    \s*\.\s*
+                )?
+                \[?([A-Za-z_][\w$#]*)\]?
+                \s*\.\s*
+                \[?([A-Za-z_][\w$#]*)\]?
+                (?=
+                    \s
+                    |$
+                )
+                """,
+                entry,
+                flags=re.IGNORECASE | re.VERBOSE
+            )
+
+            if not match:
+                continue
+
+            database_name = match.group(1)
+            schema_name = match.group(2)
+            object_name = match.group(3)
+
+            schema_name = schema_name.strip("[] ")
+            object_name = object_name.strip("[] ")
+
+            schema_lower = schema_name.lower()
+            object_lower = object_name.lower()
+
+            # Ignore temporary objects
+            if (
+                schema_name.startswith("#")
+                or object_name.startswith("#")
+            ):
+                continue
+
+            # Ignore CTE references
+            if (
+                schema_lower in cte_names
+                or object_lower in cte_names
+            ):
+                continue
+
+            # Ignore alias.column references
+            if schema_lower in alias_names:
+                continue
+
+            found.add(
+                (
+                    schema_name,
+                    object_name
+                )
+            )
+
+    # Final protection against alias.column being stored
+    found = {
+        (schema_name, object_name)
+        for schema_name, object_name in found
+        if schema_name.lower() not in alias_names
+    }
 
     return sorted(found)
-
-
-# =========================
-# RDL / shared datasource parsing
-# =========================
-
-def parse_shared_datasource_xml(xml_text, item_name, item_path):
-    cleaned_xml = clean_xml_text(xml_text)
-    if not cleaned_xml:
-        return None
-
-    root = ET.fromstring(cleaned_xml)
-    namespace = get_namespace(root)
-
-    connect_string = node_text(root, namespace, "ConnectString")
-    data_provider = node_text(root, namespace, "Extension") or node_text(root, namespace, "DataProvider")
-    user_name = node_text(root, namespace, "UserName")
-
-    datasource_type = normalize_datasource_type(data_provider, connect_string)
-
-    return {
-        "datasource_name": item_name,
-        "datasource_path": item_path,
-        "connection_string": connect_string,
-        "connection_username": user_name,
-        "server_instance": extract_server_instance(connect_string),
-        "database_name": extract_database_name(connect_string, datasource_type),
-        "datasource_type": datasource_type,
-        "datasource_reference": item_path,
-        "data_provider": data_provider,
-        "is_shared": True,
-    }
-
-
-def parse_shared_datasource(row):
-    connect_string = decode_binary_text(getattr(row, "ConnectionString", None))
-    if not connect_string:
-        connect_string = decode_binary_text(getattr(row, "OriginalConnectionString", None))
-
-    user_name = decode_binary_text(getattr(row, "UserName", None))
-    data_provider = getattr(row, "Extension", None)
-    datasource_type = normalize_datasource_type(data_provider, connect_string)
-
-    # Primary source = dbo.DataSource
-    if connect_string or data_provider or user_name:
-        return {
-            "datasource_name": row.Name,
-            "datasource_path": row.Path,
-            "connection_string": connect_string,
-            "connection_username": user_name,
-            "server_instance": extract_server_instance(connect_string),
-            "database_name": extract_database_name(connect_string, datasource_type),
-            "datasource_type": datasource_type,
-            "datasource_reference": row.Path,
-            "data_provider": data_provider,
-            "is_shared": True,
-        }
-
-    # Fallback only if DataSource table did not provide readable values
-    xml_text = decode_xml_content(getattr(row, "Content", None))
-    if xml_text:
-        return parse_shared_datasource_xml(xml_text, row.Name, row.Path)
-
-    return {
-        "datasource_name": row.Name,
-        "datasource_path": row.Path,
-        "connection_string": None,
-        "connection_username": None,
-        "server_instance": None,
-        "database_name": None,
-        "datasource_type": normalize_datasource_type(data_provider, None),
-        "datasource_reference": row.Path,
-        "data_provider": data_provider,
-        "is_shared": True,
-    }
 
 
 def parse_rdl(xml_text):
@@ -559,32 +1296,43 @@ def parse_rdl(xml_text):
             user_name = None
             server_instance = None
             database_name = None
-            data_provider = None
             datasource_type = None
 
             conn_props = ds.find(ns_tag(namespace, "ConnectionProperties"))
             if conn_props is not None:
-                connect_string = node_text(conn_props, namespace, "ConnectString")
-                user_name = node_text(conn_props, namespace, "UserName")
-                data_provider = node_text(conn_props, namespace, "DataProvider") or node_text(conn_props, namespace, "Extension")
-                datasource_type = normalize_datasource_type(data_provider, connect_string)
+                cs_node = conn_props.find(ns_tag(namespace, "ConnectString"))
+                un_node = conn_props.find(ns_tag(namespace, "UserName"))
+                dp_node = conn_props.find(ns_tag(namespace, "DataProvider"))
+                ext_node = conn_props.find(ns_tag(namespace, "Extension"))
+
+                if cs_node is not None and cs_node.text:
+                    connect_string = cs_node.text.strip()
+
+                if un_node is not None and un_node.text:
+                    user_name = un_node.text.strip()
+
+                # Some RDL/shared datasource XML versions use <DataProvider>,
+                # while others use <Extension>. Load either value into DataSource_Type.
+                if dp_node is not None and dp_node.text:
+                    datasource_type = dp_node.text.strip()
+                elif ext_node is not None and ext_node.text:
+                    datasource_type = ext_node.text.strip()
+
                 server_instance = extract_server_instance(connect_string)
-                database_name = extract_database_name(connect_string, datasource_type)
+                database_name = extract_database_name(connect_string)
 
             ds_ref_node = ds.find(ns_tag(namespace, "DataSourceReference"))
             datasource_reference = ds_ref_node.text.strip() if ds_ref_node is not None and ds_ref_node.text else None
 
-            datasource_map[ds_name] = {
+            datasource_map[ds_name.upper()] = {
                 "datasource_name": ds_name,
-                "datasource_path": datasource_reference,
                 "connection_string": connect_string,
                 "connection_username": user_name,
                 "server_instance": server_instance,
                 "database_name": database_name,
                 "datasource_type": datasource_type,
                 "datasource_reference": datasource_reference,
-                "data_provider": data_provider,
-                "is_shared": bool(datasource_reference),
+                "is_shared_datasource": 0
             }
 
     queries = []
@@ -602,25 +1350,52 @@ def parse_rdl(xml_text):
 
                 if ds_node is not None and ds_node.text:
                     datasource_name = ds_node.text.strip()
+                else:
+                    datasource_name = None
+
                 if ct_node is not None and ct_node.text:
                     command_text = ct_node.text.strip()
 
-            queries.append(
-                {
-                    "dataset_name": dataset_name,
-                    "datasource_name": datasource_name,
-                    "command_text": command_text,
-                    "objects": extract_schema_objects(command_text),
-                }
-            )
+            queries.append({
+                "dataset_name": dataset_name,
+                "datasource_name": datasource_name,
+                "command_text": command_text,
+                "objects": extract_schema_objects(command_text)
+            })
 
-    return list(datasource_map.values()), queries
+    datasources = list(datasource_map.values())
 
+    for q in queries:
+        dsn = q.get("datasource_name")
+        if dsn:
+            dsn_key = dsn.upper()
 
-# =========================
-# Target load helpers
-# =========================
+            if dsn_key not in datasource_map:
+                raise ValueError(
+                    f"Datasource could not be resolved for dataset: {q.get('dataset_name')}. "
+                    f"Dataset DataSourceName={dsn}. "
+                    f"Available datasources={[ds.get('datasource_name') for ds in datasources]}"
+                    )            
 
+    seen = set()
+    deduped = []
+    for ds in datasources:
+        key = (
+            ds.get("datasource_name"),
+            ds.get("connection_string"),
+            ds.get("connection_username"),
+            ds.get("server_instance"),
+            ds.get("database_name"),
+            ds.get("datasource_type"),
+            ds.get("datasource_reference")
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(ds)
+
+    return deduped, queries
+
+""" Use this when we need to delete tables data instead of Truncating tables"""
 def clear_target_tables(target_conn):
     cursor = target_conn.cursor()
     print("Clearing target tables in dependency order...")
@@ -633,7 +1408,7 @@ def clear_target_tables(target_conn):
     print("Target tables cleared.")
 
 
-def insert_rpt_catalog(cursor, report_row):
+def insert_rpt_catalog(cursor, report_row, source_database):
     sql = f"""
         INSERT INTO {TARGET_RPT_CATALOG}
         (
@@ -641,13 +1416,14 @@ def insert_rpt_catalog(cursor, report_row):
             RPT_Type,
             RPT_Business_Suite,
             RPT_Path,
+            SSRS_Access_Method,
             Created_By,
             Created_Date,
             Updated_By,
             Updated_Date
         )
         OUTPUT INSERTED.RPT_ID
-        VALUES (?, ?, ?, ?, USER_NAME(), GETDATE(), USER_NAME(), GETDATE())
+        VALUES (?, ?, ?, ?, ?, USER_NAME(), GETDATE(), USER_NAME(), GETDATE())
     """
     cursor.execute(
         sql,
@@ -655,11 +1431,19 @@ def insert_rpt_catalog(cursor, report_row):
         report_row["report_type"],
         report_row["business_suite"],
         report_row["report_path"],
+        source_database
     )
     return cursor.fetchone()[0]
 
 
-def get_existing_datasource_id(cursor, ds_row):
+def _first_existing_column(table_columns, *candidate_names):
+    for name in candidate_names:
+        if name.lower() in table_columns:
+            return name
+    return None
+
+
+def get_or_create_datasource(cursor, ds_row, rpt_datasource_columns, source_database):
     find_sql = f"""
         SELECT TOP 1 DataSource_ID
         FROM {TARGET_RPT_DATASOURCES}
@@ -667,8 +1451,6 @@ def get_existing_datasource_id(cursor, ds_row):
           AND ISNULL(Connection_String_Text, '') = ISNULL(?, '')
           AND ISNULL(Connection_UserName, '') = ISNULL(?, '')
           AND ISNULL(Server_Instance, '') = ISNULL(?, '')
-          AND ISNULL(Database_Name, '') = ISNULL(?, '')
-          AND ISNULL(DataSource_Type, '') = ISNULL(?, '')
         ORDER BY DataSource_ID
     """
     cursor.execute(
@@ -676,45 +1458,59 @@ def get_existing_datasource_id(cursor, ds_row):
         ds_row.get("datasource_name"),
         ds_row.get("connection_string"),
         ds_row.get("connection_username"),
-        ds_row.get("server_instance"),
-        ds_row.get("database_name"),
-        ds_row.get("datasource_type"),
+        ds_row.get("server_instance")
     )
     existing = cursor.fetchone()
-    return existing[0] if existing else None
+    if existing:
+        return existing[0]
 
+    columns = [
+        "DataSource_Name",
+        "Connection_String_Text",
+        "Connection_UserName",
+        "Server_Instance"
+    ]
+    values = [
+        ds_row.get("datasource_name"),
+        ds_row.get("connection_string"),
+        ds_row.get("connection_username"),
+        ds_row.get("server_instance")
+    ]
 
-def insert_datasource(cursor, ds_row):
-    existing_id = get_existing_datasource_id(cursor, ds_row)
-    if existing_id:
-        return existing_id
+    # Load optional columns only if they exist in your target table.
+    database_col = _first_existing_column(rpt_datasource_columns, "Database_Name")
+    datasource_type_col = _first_existing_column(rpt_datasource_columns, "DataSource_Type", "Datasource_Type", "Extension")
+    shared_path_col = _first_existing_column(rpt_datasource_columns, "DataSource_Path", "Shared_DataSource_Path")    
+
+    if database_col:
+        columns.append(database_col)
+        values.append(ds_row.get("database_name"))
+
+    if datasource_type_col:
+        columns.append(datasource_type_col)
+        values.append(ds_row.get("datasource_type"))
+
+    if shared_path_col:
+        columns.append(shared_path_col)
+        values.append(ds_row.get("shared_datasource_path"))
+
+    ssrs_access_method_col = _first_existing_column(rpt_datasource_columns, "SSRS_Access_Method")
+    if ssrs_access_method_col: columns.append(ssrs_access_method_col)
+    values.append(source_database)
+
+    columns.extend(["Created_By", "Created_Date", "Updated_By", "Updated_Date"])
+    column_text = ",\n            ".join(columns)
+    placeholders = ", ".join(["?"] * len(values))
 
     insert_sql = f"""
         INSERT INTO {TARGET_RPT_DATASOURCES}
         (
-            DataSource_Name,
-            Connection_String_Text,
-            Connection_UserName,
-            Server_Instance,
-            Database_Name,
-            DataSource_Type,
-            Created_By,
-            Created_Date,
-            Updated_By,
-            Updated_Date
+            {column_text}
         )
         OUTPUT INSERTED.DataSource_ID
-        VALUES (?, ?, ?, ?, ?, ?, USER_NAME(), GETDATE(), USER_NAME(), GETDATE())
+        VALUES ({placeholders}, USER_NAME(), GETDATE(), USER_NAME(), GETDATE())
     """
-    cursor.execute(
-        insert_sql,
-        ds_row.get("datasource_name"),
-        ds_row.get("connection_string"),
-        ds_row.get("connection_username"),
-        ds_row.get("server_instance"),
-        ds_row.get("database_name"),
-        ds_row.get("datasource_type"),
-    )
+    cursor.execute(insert_sql, *values)
     return cursor.fetchone()[0]
 
 
@@ -764,12 +1560,13 @@ def insert_query(cursor, rpt_id, datasource_id, query_row):
         rpt_id,
         datasource_id,
         query_row.get("dataset_name"),
-        query_row.get("command_text"),
+        query_row.get("command_text")
     )
     return cursor.fetchone()[0]
 
 
-def insert_object(cursor, rpt_id, query_id, datasource_id, report_name, dataset_name, database_name, schema_name, object_name):
+def insert_object(cursor, rpt_id, query_id, datasource_id, report_name, dataset_name,
+                  database_name, schema_name, object_name):
     sql = f"""
         INSERT INTO {TARGET_RPT_OBJECTS}
         (
@@ -797,7 +1594,7 @@ def insert_object(cursor, rpt_id, query_id, datasource_id, report_name, dataset_
         dataset_name,
         database_name,
         schema_name,
-        object_name,
+        object_name
     )
 
 
@@ -805,7 +1602,7 @@ def insert_rpt_servers(cursor):
     sql = f"""
         INSERT INTO {TARGET_RPT_SERVERS}
         (
-            Server_Name,
+            Server_Instance,
             Database_Name,
             Created_By,
             Created_Date,
@@ -827,72 +1624,17 @@ def insert_rpt_servers(cursor):
           AND NOT EXISTS (
               SELECT 1
               FROM {TARGET_RPT_SERVERS} s
-              WHERE ISNULL(s.Server_Name, '') = ISNULL(ds.Server_Instance, '')
+              WHERE ISNULL(s.Server_Instance, '') = ISNULL(ds.Server_Instance, '')
                 AND ISNULL(s.Database_Name, '') = ISNULL(o.Database_Name, '')
           )
     """
     cursor.execute(sql)
 
+def normalize_datasource_key(value):
+    if not value: return None
+    return value.strip().upper().replace(" ", "")
 
-# =========================
-# Shared datasource / report processing
-# =========================
-
-def load_shared_datasources(cursor, shared_rows):
-    datasource_id_by_path = {}
-    datasource_id_by_name = {}
-    datasource_info_by_path = {}
-    datasource_info_by_name = {}
-    count = 0
-
-    for row in shared_rows:
-        print(f"\nLoading shared datasource: {row.Path}")
-        try:
-            ds_row = parse_shared_datasource(row)
-            datasource_id = insert_datasource(cursor, ds_row)
-            count += 1
-
-            if row.Path:
-                datasource_id_by_path[row.Path] = datasource_id
-                datasource_info_by_path[row.Path] = ds_row
-            if row.Name:
-                datasource_id_by_name[row.Name] = datasource_id
-                datasource_info_by_name[row.Name] = ds_row
-
-            print(
-                f"  Inserted/Found DataSource_ID = {datasource_id}, "
-                f"Name = {ds_row.get('datasource_name')}, "
-                f"Type = {ds_row.get('datasource_type')}, "
-                f"Database = {ds_row.get('database_name')}"
-            )
-        except Exception as ex:
-            print(f"  Shared datasource failed and was skipped: {row.Path}")
-            print_error(ex)
-
-    return {
-        "count": count,
-        "id_by_path": datasource_id_by_path,
-        "id_by_name": datasource_id_by_name,
-        "info_by_path": datasource_info_by_path,
-        "info_by_name": datasource_info_by_name,
-    }
-
-
-def resolve_datasource_for_report(cursor, report_ds, shared_lookup):
-    ds_reference = report_ds.get("datasource_reference")
-    ds_name = report_ds.get("datasource_name")
-
-    if ds_reference and ds_reference in shared_lookup["id_by_path"]:
-        return shared_lookup["id_by_path"][ds_reference], shared_lookup["info_by_path"][ds_reference]
-
-    if ds_name and ds_name in shared_lookup["id_by_name"]:
-        return shared_lookup["id_by_name"][ds_name], shared_lookup["info_by_name"][ds_name]
-
-    datasource_id = insert_datasource(cursor, report_ds)
-    return datasource_id, report_ds
-
-
-def process_report(cursor, source_row, shared_lookup):
+def process_report(cursor, source_row, shared_datasource_lookup, rpt_datasource_columns, source_database):
     report_name = source_row.Name
     report_type = str(source_row.Type) if source_row.Type is not None else None
     report_path = source_row.Path
@@ -900,53 +1642,75 @@ def process_report(cursor, source_row, shared_lookup):
 
     print(f"\nProcessing report: {report_path}")
 
-    xml_text = decode_xml_content(content)
+    xml_text = decode_rdl_content(content)
     if not xml_text:
         raise ValueError("Could not decode Content field into RDL XML.")
 
-    report_datasources, queries = parse_rdl(xml_text)
+    datasources, queries = parse_rdl(xml_text)
+    datasources = apply_shared_datasource_values(source_row.ItemID, datasources, shared_datasource_lookup)
 
-    rpt_id = insert_rpt_catalog(
-        cursor,
-        {
-            "report_name": report_name,
-            "report_type": report_type,
-            "business_suite": BUSINESS_SUITE_VALUE,
-            "report_path": report_path,
-        },
-    )
+    report_row = {
+        "report_name": report_name,
+        "report_type": report_type,
+        "business_suite": get_business_suite(report_path),
+        "report_path": report_path
+    }
+
+    rpt_id = insert_rpt_catalog(cursor, report_row, source_database)
     print(f"  Inserted RPT_Catalog row. RPT_ID = {rpt_id}")
 
-    resolved_id_map = {}
-    resolved_info_map = {}
+    datasource_id_map = {}
+    datasource_info_map = {}
+    datasource_count = 0
     map_count = 0
     query_count = 0
     object_count = 0
 
-    for ds in report_datasources:
-        datasource_id, datasource_info = resolve_datasource_for_report(cursor, ds, shared_lookup)
+    for ds in datasources:
+        datasource_id = get_or_create_datasource(cursor, ds, rpt_datasource_columns, source_database)
         datasource_name = ds.get("datasource_name")
-        resolved_id_map[datasource_name] = datasource_id
-        resolved_info_map[datasource_name] = datasource_info
+
+        for name in [
+            ds.get("datasource_name"),
+            ds.get("report_datasource_name"),
+            ds.get("shared_datasource_name")
+        ]:
+
+            if name:
+                key = normalize_datasource_key(name)
+                datasource_id_map[key] = datasource_id
+                datasource_info_map[key] = ds
+
+        datasource_count += 1
 
         ensure_datasource_map(cursor, rpt_id, datasource_id)
         map_count += 1
-        print(
-            f"  Mapped datasource: {datasource_name} -> DataSource_ID = {datasource_id} "
-            f"(Reference = {ds.get('datasource_reference')})"
-        )
+        print(f"  Mapped datasource: {datasource_name} -> DataSource_ID = {datasource_id}")
 
     for q in queries:
         datasource_name = q.get("datasource_name")
-        datasource_id = resolved_id_map.get(datasource_name)
-        datasource_info = resolved_info_map.get(datasource_name, {})
+        if not datasource_name and len(datasource_id_map) ==1:
+            datasource_id = list(datasource_id_map.values())[0]
+            datasource_info = list(datasource_info.map.values())[0]
+        elif not datasource_name:
+            print(f" Skipping dataset with no DataSourceName: {q.get('dataset_name')}. "
+                  f"Avaiable datasource keys = {list(datasource_id_map.keys())}"
+            )
+            continue
+        else:
+            datasource_key = normalize_datasource_key(datasource_name)        
+            datasource_id = datasource_id_map.get(datasource_key)
+            datasource_info = datasource_info_map.get(datasource_key, {})
 
-        if datasource_id is None and len(resolved_id_map) == 1:
-            datasource_id = list(resolved_id_map.values())[0]
-            datasource_info = list(resolved_info_map.values())[0]
+        if datasource_id is None and len(datasource_id_map) == 1:
+            datasource_id = list(datasource_id_map.values())[0]
+            datasource_info = list(datasource_info_map.values())[0]
 
         if datasource_id is None:
-            raise ValueError(f"Datasource could not be resolved for dataset: {q.get('dataset_name')}")
+            raise ValueError(f"Datasource could not be resolved for dataset: {q.get('dataset_name')}. "
+                             f"Dataset datasource name = {datasource_name}. "
+                             f"Avaiable datasource keys = {list(datasource_id_map.keys())}"
+                             )
 
         query_id = insert_query(cursor, rpt_id, datasource_id, q)
         query_count += 1
@@ -954,6 +1718,7 @@ def process_report(cursor, source_row, shared_lookup):
         print(f"  Objects found for dataset {q.get('dataset_name')}: {q.get('objects', [])}")
 
         database_name = datasource_info.get("database_name")
+
         for schema_name, object_name in q.get("objects", []):
             insert_object(
                 cursor,
@@ -964,21 +1729,102 @@ def process_report(cursor, source_row, shared_lookup):
                 q.get("dataset_name"),
                 database_name,
                 schema_name,
-                object_name,
+                object_name
             )
             object_count += 1
 
     return {
         "catalog": 1,
+        "datasources": datasource_count,
         "maps": map_count,
         "queries": query_count,
-        "objects": object_count,
+        "objects": object_count
     }
 
+def normalize_environment_values(cursor):
 
-# =========================
-# Main
-# =========================
+    # ---------------------------------------------------------
+    # Update RPT_Datasources
+    # ---------------------------------------------------------
+    update_datasources_sql = """
+        UPDATE RPT_Datasources
+        SET
+            Connection_String_Text =
+                CASE
+                    WHEN Connection_String_Text LIKE '%DATA SOURCE=TSTIJ%'
+                    THEN REPLACE(
+                        Connection_String_Text,
+                        'DATA SOURCE=TSTIJ',
+                        'DATA SOURCE=PRDIJ'
+                    )
+
+                    WHEN Connection_String_Text LIKE '%DATA SOURCE=STGIJ%'
+                    THEN REPLACE(
+                        Connection_String_Text,
+                        'DATA SOURCE=STGIJ',
+                        'DATA SOURCE=PRDIJ'
+                    )
+
+                    ELSE Connection_String_Text
+                END,
+
+            Server_Instance =
+                CASE
+                    WHEN Server_Instance LIKE 'TSTIJ%'
+                      OR Server_Instance LIKE 'STGIJ%'
+                    THEN STUFF(Server_Instance, 1, 5, 'PRDIJ')
+                    ELSE Server_Instance
+                END,
+
+            Database_Name =
+                CASE
+                    WHEN Database_Name LIKE 'TSTIJ%'
+                      OR Database_Name LIKE 'STGIJ%'
+                    THEN STUFF(Database_Name, 1, 5, 'PRDIJ')
+                    ELSE Database_Name
+                END
+
+        WHERE
+               Connection_String_Text LIKE '%DATA SOURCE=TSTIJ%'
+            OR Connection_String_Text LIKE '%DATA SOURCE=STGIJ%'
+            OR Server_Instance LIKE 'TSTIJ%'
+            OR Server_Instance LIKE 'STGIJ%'
+            OR Database_Name LIKE 'TSTIJ%'
+            OR Database_Name LIKE 'STGIJ%';
+    """
+
+    cursor.execute(update_datasources_sql)
+
+    print(
+        "RPT_Datasources environment values updated. "
+        f"Rows affected: {cursor.rowcount}"
+    )
+
+    # ---------------------------------------------------------
+    # Update RPT_Objects
+    # ---------------------------------------------------------
+    update_objects_sql = """
+        UPDATE RPT_Objects
+        SET
+            Database_Name =
+                CASE
+                    WHEN Database_Name LIKE 'TSTIJ%'
+                      OR Database_Name LIKE 'STGIJ%'
+                    THEN STUFF(Database_Name, 1, 5, 'PRDIJ')
+                    ELSE Database_Name
+                END
+
+        WHERE
+               Database_Name LIKE 'TSTIJ%'
+            OR Database_Name LIKE 'STGIJ%';
+    """
+
+    cursor.execute(update_objects_sql)
+
+    print(
+        "RPT_Objects Database_Name updated. "
+        f"Rows affected: {cursor.rowcount}"
+    )
 
 def main():
     source_conn = None
@@ -990,104 +1836,146 @@ def main():
     total_queries = 0
     total_objects = 0
 
-    target_tables_text = ", ".join(
-        [
-            TARGET_RPT_CATALOG,
-            TARGET_RPT_DATASOURCES,
-            TARGET_RPT_DATASOURCE_MAP,
-            TARGET_RPT_QUERIES,
-            TARGET_RPT_OBJECTS,
-            TARGET_RPT_SERVERS,
-        ]
-    )
+    target_tables_text = ", ".join([
+        TARGET_RPT_CATALOG,
+        TARGET_RPT_DATASOURCES,
+        TARGET_RPT_DATASOURCE_MAP,
+        TARGET_RPT_QUERIES,
+        TARGET_RPT_OBJECTS,
+        TARGET_RPT_SERVERS
+    ])
 
     try:
         print("ETL started")
         print(f"Start time: {datetime.now()}")
 
-        source_server, source_database, source_auth_type, source_username, source_password = get_connection_inputs("Source")
-        print(f"Connecting to source: {source_server} / {source_database}")
-        source_conn = get_connection(source_server, source_database, source_auth_type, source_username, source_password)
-        print("Connected to source.")
-
-        target_server, target_database, target_auth_type, target_username, target_password = get_connection_inputs("Target")
-        print(f"Connecting to target: {target_server} / {target_database}")
-        target_conn = get_connection(target_server, target_database, target_auth_type, target_username, target_password)
+        environment_name = get_environment_input()
+        apply_environment_config(environment_name)
+        
+        print(f"Connecting to target: {TARGET_SERVER} / {TARGET_DATABASE}")
+        target_conn = get_connection(TARGET_SERVER, TARGET_DATABASE)
         print("Connected to target.")
-
-        report_rows = fetch_reports(source_conn)
-        shared_datasource_rows = fetch_shared_datasources(source_conn)
-
-        if not report_rows and not shared_datasource_rows:
-            print("No source rows found. Nothing to load.")
-            return
-
+        
         if CLEAR_TARGET_TABLES_BEFORE_LOAD:
             clear_target_tables(target_conn)
 
         cursor = target_conn.cursor()
+        rpt_datasource_columns = get_table_columns(cursor, TARGET_RPT_DATASOURCES)
 
-        shared_lookup = load_shared_datasources(cursor, shared_datasource_rows)
-        target_conn.commit()
-        total_datasources += shared_lookup["count"]
+        for source in SOURCES:
+            source_conn = None
 
-        for row in report_rows:
+            SOURCE_SERVER = source["SOURCE_SERVER"]
+            SOURCE_DATABASE = source["SOURCE_DATABASE"]
+
             try:
-                counts = process_report(cursor, row, shared_lookup)
+                print("\n" + "=" * 80)
+                print(f"Connecting to source: {SOURCE_SERVER} / {SOURCE_DATABASE}")
+                print("=" * 80)
+
+                source_conn = get_connection(SOURCE_SERVER, SOURCE_DATABASE)
+                print("Connected to source.")
+
+                source_rows = fetch_catalog_rows(source_conn)
+
+                if not source_rows:
+                    print("No source rows found. Nothing to load.")
+                    continue
+
+                shared_datasource_lookup = fetch_shared_datasource_lookup(source_conn)
+                catalog_type5_datasources = fetch_catalog_type5_datasources(source_conn)
+        
+                for row in source_rows:
+                    try:
+                        counts = process_report(cursor, row, shared_datasource_lookup, rpt_datasource_columns, SOURCE_DATABASE)
+                        target_conn.commit()
+
+                        total_catalog += counts["catalog"]
+                        total_datasources += counts["datasources"]
+                        total_maps += counts["maps"]
+                        total_queries += counts["queries"]
+                        total_objects += counts["objects"]
+
+                    except Exception as ex:
+                        target_conn.rollback()
+                        print(f"  Report failed and rolled back: {row.Path}")
+                        print_error(ex)
+
+                        log_error_to_table(
+                            target_conn=target_conn,
+                            process_name=PROCESS_NAME,
+                            source_table=SOURCE_TABLE,
+                            target_table=target_tables_text,
+                            report_path=getattr(row, "Path", None),
+                            report_name=getattr(row, "Name", None),
+                            error_type=type(ex).__name__,
+                            error_message=str(ex),
+                            error_details=traceback.format_exc()
+                        )
+            finally:
+                if source_conn:
+                    source_conn.close()
+                    print(f"Source connection closed: {SOURCE_SERVER} / {SOURCE_DATABASE}")
+
+            try:
+                print("\nInserting rows into dbo.RPT_Servers...")
+                insert_rpt_servers(cursor)
                 target_conn.commit()
-
-                total_catalog += counts["catalog"]
-                total_maps += counts["maps"]
-                total_queries += counts["queries"]
-                total_objects += counts["objects"]
-
+                print("RPT_Servers load completed.")
             except Exception as ex:
                 target_conn.rollback()
-                print(f"  Report failed and rolled back: {row.Path}")
+                print("RPT_Servers load failed.")
                 print_error(ex)
                 log_error_to_table(
                     target_conn=target_conn,
                     process_name=PROCESS_NAME,
-                    source_table=SOURCE_CATALOG_TABLE,
-                    target_table=target_tables_text,
-                    report_path=getattr(row, "Path", None),
-                    report_name=getattr(row, "Name", None),
+                    source_table=f"{TARGET_RPT_DATASOURCES}, {TARGET_RPT_OBJECTS}",
+                    target_table=TARGET_RPT_SERVERS,
+                    report_path=None,
+                    report_name=None,
                     error_type=type(ex).__name__,
                     error_message=str(ex),
-                    error_details=traceback.format_exc(),
+                    error_details=traceback.format_exc()
                 )
 
-        try:
-            print("\nInserting rows into dbo.RPT_Servers...")
-            insert_rpt_servers(cursor)
-            target_conn.commit()
-            print("RPT_Servers load completed.")
-        except Exception as ex:
-            target_conn.rollback()
-            print("RPT_Servers load failed.")
-            print_error(ex)
-            log_error_to_table(
-                target_conn=target_conn,
-                process_name=PROCESS_NAME,
-                source_table=f"{TARGET_RPT_DATASOURCES}, {TARGET_RPT_OBJECTS}",
-                target_table=TARGET_RPT_SERVERS,
-                report_path=None,
-                report_name=None,
-                error_type=type(ex).__name__,
-                error_message=str(ex),
-                error_details=traceback.format_exc(),
-            )
+            #========================================
+            #Final environment normalization
+                # TST / STG values to PRD
+                # running after all metadata loading is completed
+            #========================================    
 
-        print("\nLOAD SUMMARY")
-        print("-" * 60)
-        print(f"RPT_Catalog rows inserted       : {total_catalog}")
-        print(f"Datasource rows processed       : {total_datasources}")
-        print(f"Datasource map rows inserted    : {total_maps}")
-        print(f"Query rows inserted             : {total_queries}")
-        print(f"Object rows inserted            : {total_objects}")
-        print("-" * 60)
-        print(f"End time: {datetime.now()}")
-        print("ETL completed.")
+            if environment_name.upper() == "PROD":
+                
+                try:
+                    print("\nNormalizing TST/STG values to PRD...")
+
+                    normalize_environment_values(cursor)
+
+                    target_conn.commit()
+                    print("Environment normalization is completed.")
+                
+                except Exception as ex:
+                    target_conn.rollback()
+                    print("Environment normalization failed.")
+                    print_error(ex)
+
+                    raise
+            else:
+                print(
+                    f"\nEnvironment is {environment_name}. "
+                    "TST/STG to PRD normalization skipped. "
+                    )
+
+            print("\nLOAD SUMMARY")
+            print("-" * 60)
+            print(f"RPT_Catalog rows inserted       : {total_catalog}")
+            print(f"Datasource rows processed       : {total_datasources}")
+            print(f"Datasource map rows inserted    : {total_maps}")
+            print(f"Query rows inserted             : {total_queries}")
+            print(f"Object rows inserted            : {total_objects}")
+            print("-" * 60)
+            print(f"End time: {datetime.now()}")
+            print("ETL completed.")
 
     except Exception as ex:
         print("\nFatal error occurred.")
@@ -1097,21 +1985,18 @@ def main():
                 log_error_to_table(
                     target_conn=target_conn,
                     process_name=PROCESS_NAME,
-                    source_table=SOURCE_CATALOG_TABLE,
+                    source_table=SOURCE_TABLE,
                     target_table=target_tables_text,
                     report_path=None,
                     report_name=None,
                     error_type=type(ex).__name__,
                     error_message=str(ex),
-                    error_details=traceback.format_exc(),
+                    error_details=traceback.format_exc()
                 )
             except Exception:
                 pass
 
     finally:
-        if source_conn:
-            source_conn.close()
-            print("Source connection closed.")
         if target_conn:
             target_conn.close()
             print("Target connection closed.")
