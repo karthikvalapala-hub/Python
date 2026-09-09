@@ -1,0 +1,178 @@
+def get_or_create_datasource(
+    cursor,
+    ds_row,
+    rpt_datasource_columns,
+    source_database
+):
+    ssrs_access_method_col = _first_existing_column(
+        rpt_datasource_columns,
+        "SSRS_Access_Method"
+    )
+
+    # ---------------------------------------------------------
+    # Check datasource using BOTH datasource properties
+    # AND the source ReportServer database.
+    #
+    # Example:
+    # SSRS_ORACLE_PRODUCT + ReportServerTST
+    # SSRS_ORACLE_PRODUCT + ReportServerProd
+    #
+    # These should be two separate records.
+    # ---------------------------------------------------------
+
+    if ssrs_access_method_col:
+
+        find_sql = f"""
+            SELECT TOP 1 DataSource_ID
+            FROM {TARGET_RPT_DATASOURCES}
+            WHERE ISNULL(DataSource_Name, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL(Connection_String_Text, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL(Connection_UserName, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL(Server_Instance, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL({ssrs_access_method_col}, '') =
+                  ISNULL(?, '')
+
+            ORDER BY DataSource_ID
+        """
+
+        cursor.execute(
+            find_sql,
+            ds_row.get("datasource_name"),
+            ds_row.get("connection_string"),
+            ds_row.get("connection_username"),
+            ds_row.get("server_instance"),
+            source_database
+        )
+
+    else:
+
+        find_sql = f"""
+            SELECT TOP 1 DataSource_ID
+            FROM {TARGET_RPT_DATASOURCES}
+            WHERE ISNULL(DataSource_Name, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL(Connection_String_Text, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL(Connection_UserName, '') =
+                  ISNULL(?, '')
+
+              AND ISNULL(Server_Instance, '') =
+                  ISNULL(?, '')
+
+            ORDER BY DataSource_ID
+        """
+
+        cursor.execute(
+            find_sql,
+            ds_row.get("datasource_name"),
+            ds_row.get("connection_string"),
+            ds_row.get("connection_username"),
+            ds_row.get("server_instance")
+        )
+
+    existing = cursor.fetchone()
+
+    if existing:
+        return existing[0]
+
+    # ---------------------------------------------------------
+    # Datasource does not exist for this ReportServer database
+    # -> insert new record
+    # ---------------------------------------------------------
+
+    columns = [
+        "DataSource_Name",
+        "Connection_String_Text",
+        "Connection_UserName",
+        "Server_Instance"
+    ]
+
+    values = [
+        ds_row.get("datasource_name"),
+        ds_row.get("connection_string"),
+        ds_row.get("connection_username"),
+        ds_row.get("server_instance")
+    ]
+
+    database_col = _first_existing_column(
+        rpt_datasource_columns,
+        "Database_Name"
+    )
+
+    datasource_type_col = _first_existing_column(
+        rpt_datasource_columns,
+        "DataSource_Type",
+        "Datasource_Type",
+        "Extension"
+    )
+
+    shared_path_col = _first_existing_column(
+        rpt_datasource_columns,
+        "DataSource_Path",
+        "Shared_DataSource_Path"
+    )
+
+    if database_col:
+        columns.append(database_col)
+        values.append(ds_row.get("database_name"))
+
+    if datasource_type_col:
+        columns.append(datasource_type_col)
+        values.append(ds_row.get("datasource_type"))
+
+    if shared_path_col:
+        columns.append(shared_path_col)
+        values.append(ds_row.get("shared_datasource_path"))
+
+    # Source SSRS database
+    if ssrs_access_method_col:
+        columns.append(ssrs_access_method_col)
+        values.append(source_database)
+
+    columns.extend(
+        [
+            "Created_By",
+            "Created_Date",
+            "Updated_By",
+            "Updated_Date"
+        ]
+    )
+
+    column_text = ",\n            ".join(columns)
+
+    placeholders = ", ".join(
+        ["?"] * len(values)
+    )
+
+    insert_sql = f"""
+        INSERT INTO {TARGET_RPT_DATASOURCES}
+        (
+            {column_text}
+        )
+        OUTPUT INSERTED.DataSource_ID
+        VALUES
+        (
+            {placeholders},
+            USER_NAME(),
+            GETDATE(),
+            USER_NAME(),
+            GETDATE()
+        )
+    """
+
+    cursor.execute(
+        insert_sql,
+        *values
+    )
+
+    return cursor.fetchone()[0]
