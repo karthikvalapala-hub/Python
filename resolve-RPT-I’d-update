@@ -1,0 +1,120 @@
+def resolve_rpt_folder_id(cursor, report_path, source_database):
+    """Find the SSRS folder in the pre-populated program-area lookup.
+
+    Rules:
+    1. For BAQA reports, use the subfolder immediately after BAQA.
+       Example:
+       /BAQA/Audit/products_details_Auditing -> Audit
+
+    2. For all other reports, use the first/top-level folder.
+       Example:
+       /Finance/Revenue/Revtransaction_report -> Finance
+
+    Refuse missing/ambiguous mappings rather than assigning a wrong foreign key.
+    When the lookup has an access-method column, scope by ReportServer database.
+    """
+
+    if not report_path:
+        raise ValueError("Cannot resolve RPT_Folder_ID: report path is blank")
+
+    # Normalize report path
+    normalized_path = str(report_path).replace("\\", "/").strip()
+
+    path_parts = [
+        part.strip()
+        for part in normalized_path.split("/")
+        if part.strip()
+    ]
+
+    # ---------------------------------------------------------
+    # NEW LOGIC: BAQA reports use the second-level folder.
+    # All other reports continue using the first-level folder.
+    # ---------------------------------------------------------
+
+    if not path_parts:
+        raise ValueError(
+            f"No folder found in SSRS path: {report_path!r}"
+        )
+
+    if path_parts[0].upper() == "BAQA":
+
+        # BAQA must have a subfolder and report name.
+        # Example: /BAQA/Audit/products_details_Auditing
+        if len(path_parts) < 3:
+            raise ValueError(
+                f"BAQA report path does not contain a valid subfolder: "
+                f"{report_path!r}"
+            )
+
+        # Use subfolder immediately after BAQA
+        folder_name = path_parts[1]
+
+    else:
+
+        # Existing behavior: use first/top-level folder
+        folder_name = path_parts[0] if len(path_parts) >= 2 else None
+
+    if not folder_name:
+        raise ValueError(
+            f"No valid folder found in SSRS path: {report_path!r}"
+        )
+
+    # ---------------------------------------------------------
+    # EXISTING LOGIC: Lookup RPT_Folder_ID
+    # ---------------------------------------------------------
+
+    lookup_columns = get_table_columns(
+        cursor,
+        TARGET_RPT_PROGRAM_AREA
+    )
+
+    access_col = _first_existing_column(
+        lookup_columns,
+        "SSRS_Access_Method",
+        "RPT_Access_Method"
+    )
+
+    if access_col:
+
+        sql = f"""
+            SELECT RPT_Folder_ID
+            FROM {TARGET_RPT_PROGRAM_AREA}
+            WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+              AND UPPER(LTRIM(RTRIM([{access_col}]))) = UPPER(?)
+        """
+
+        access_method = get_rpt_access_method(source_database)
+
+        cursor.execute(
+            sql,
+            folder_name,
+            access_method
+        )
+
+    else:
+
+        sql = f"""
+            SELECT RPT_Folder_ID
+            FROM {TARGET_RPT_PROGRAM_AREA}
+            WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+        """
+
+        cursor.execute(
+            sql,
+            folder_name
+        )
+
+    matches = [row[0] for row in cursor.fetchall()]
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one folder mapping, found {len(matches)} for "
+            f"RPT_Folder_Name={folder_name!r}, "
+            f"source={source_database!r}, "
+            f"RPT_ACCESS_METHOD="
+            f"{get_rpt_access_method(source_database) if access_col else 'not present'!r}, "
+            f"RPT_Path={report_path!r}. "
+            f"Verify dbo.RPT_Program_Area."
+        )
+
+    return matches[0]
