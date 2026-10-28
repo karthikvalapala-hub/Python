@@ -1,0 +1,92 @@
+def resolve_rpt_folder_id(cursor, rpt_path, rpt_access_method):
+    """
+    Resolve RPT_Folder_ID from dbo.RPT_Program_Area.
+
+    Rules:
+    1. For paths starting with /BAQA/, use the subfolder
+       immediately after BAQA.
+    2. For all other paths, use the first folder.
+    3. Match both RPT_Folder_Name and RPT_ACCESS_METHOD.
+    4. Raise an error if the mapping is missing or ambiguous.
+
+    Examples:
+        /BAQA/Audit/products_details_Auditing -> Audit
+        /BAQA/Finance/revenue_report           -> Finance
+        /Finance/Revenue/monthly_report        -> Finance
+    """
+
+    if not rpt_path or not str(rpt_path).strip():
+        return None
+
+    # Normalize the report path
+    path_parts = [
+        part.strip()
+        for part in str(rpt_path).replace("\\", "/").split("/")
+        if part.strip()
+    ]
+
+    if not path_parts:
+        return None
+
+    # BAQA special handling
+    if path_parts[0].upper() == "BAQA":
+
+        if len(path_parts) < 3:
+            raise ValueError(
+                "BAQA report path does not contain a valid "
+                f"subfolder: {rpt_path}"
+            )
+
+        folder_name = path_parts[1]
+
+    else:
+        # Existing logic for all other reports
+        folder_name = path_parts[0]
+
+    # Validate access method
+    access_method = str(rpt_access_method or "").strip().upper()
+
+    if not access_method:
+        raise ValueError(
+            f"Missing RPT_ACCESS_METHOD for path: {rpt_path}"
+        )
+
+    # Lookup RPT_Folder_ID
+    sql = """
+        SELECT RPT_Folder_ID
+        FROM dbo.RPT_Program_Area
+        WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+          AND UPPER(LTRIM(RTRIM(RPT_ACCESS_METHOD))) = ?
+    """
+
+    cursor.execute(sql, folder_name, access_method)
+
+    rows = cursor.fetchall()
+
+    if len(rows) == 0:
+        raise ValueError(
+            "No RPT_Folder_ID mapping found. "
+            f"Path={rpt_path}, "
+            f"Folder={folder_name}, "
+            f"Access_Method={access_method}"
+        )
+
+    if len(rows) > 1:
+        raise ValueError(
+            "Multiple RPT_Folder_ID mappings found. "
+            f"Path={rpt_path}, "
+            f"Folder={folder_name}, "
+            f"Access_Method={access_method}"
+        )
+
+    rpt_folder_id = rows[0][0]
+
+    print(
+        f"RPT Folder Mapping: "
+        f"Path={rpt_path} | "
+        f"Folder={folder_name} | "
+        f"Access_Method={access_method} | "
+        f"RPT_Folder_ID={rpt_folder_id}"
+    )
+
+    return rpt_folder_id
