@@ -1,0 +1,204 @@
+def resolve_rpt_folder_id(cursor, report_path, source_database):
+    """
+    Resolve RPT_Folder_ID from the pre-populated RPT_Program_Area table.
+
+    Folder mapping rules:
+
+    1. BAQA:
+       /BAQA/Alerts/Report1
+           -> BAQA/Alerts
+
+       /BAQA/Audit/Report2
+           -> BAQA/Audit
+
+    2. SBT EXTERNAL:
+       /SBT EXTERNAL/Report1
+           -> SBT EXTERNAL
+
+       /SBT EXTERNAL/AUDIT/Report2
+           -> SBT EXTERNAL/AUDIT
+
+       /SBT EXTERNAL/ALERTS/Report3
+           -> SBT EXTERNAL/ALERTS
+
+    3. Other folders:
+       /Finance/Revenue/Report1
+           -> Finance
+
+    Also validates the SSRS access method and rejects
+    missing or duplicate folder mappings.
+    """
+
+    # -------------------------------------------------------
+    # STEP 1: Validate and normalize report path
+    # -------------------------------------------------------
+
+    if not report_path:
+        raise ValueError(
+            "Cannot resolve RPT_Folder_ID: report path is blank"
+        )
+
+    normalized_path = str(report_path).replace("\\", "/").strip()
+
+    path_parts = [
+        part.strip()
+        for part in normalized_path.split("/")
+        if part.strip()
+    ]
+
+    if len(path_parts) < 2:
+        raise ValueError(
+            f"Invalid SSRS report path: {report_path!r}"
+        )
+
+    # -------------------------------------------------------
+    # STEP 2: Identify top-level folder
+    # -------------------------------------------------------
+
+    top_folder = path_parts[0].upper()
+
+    # -------------------------------------------------------
+    # STEP 3: Determine folder name for lookup
+    # -------------------------------------------------------
+
+    if top_folder == "BAQA":
+
+        # BAQA reports must have a subfolder.
+        if len(path_parts) < 3:
+            raise ValueError(
+                f"BAQA report path does not contain a subfolder: "
+                f"{report_path!r}"
+            )
+
+        folder_name = "/".join(path_parts[:2])
+
+    elif top_folder in ("SBT EXTERNAL", "SBT EXTERNAL REPORTS"):
+
+        if len(path_parts) >= 3:
+
+            # Report exists inside a subfolder.
+            # Example:
+            # /SBT EXTERNAL/AUDIT/Report
+            # -> SBT EXTERNAL/AUDIT
+
+            folder_name = "/".join(path_parts[:2])
+
+        else:
+
+            # Report exists directly under main folder.
+            # Example:
+            # /SBT EXTERNAL/Report
+            # -> SBT EXTERNAL
+
+            folder_name = path_parts[0]
+
+    else:
+
+        # Existing behavior for all other reports.
+        folder_name = path_parts[0]
+
+    # -------------------------------------------------------
+    # STEP 4: Debug folder selection
+    # -------------------------------------------------------
+
+    print("\n========== FOLDER RESOLUTION DEBUG ==========")
+    print("Report Path:", repr(report_path))
+    print("Path Parts:", path_parts)
+    print("Top Folder:", repr(top_folder))
+    print("Selected Folder:", repr(folder_name))
+    print("Source Database:", repr(source_database))
+
+    # -------------------------------------------------------
+    # STEP 5: Identify lookup table columns
+    # -------------------------------------------------------
+
+    lookup_columns = get_table_columns(
+        cursor,
+        TARGET_RPT_PROGRAM_AREA
+    )
+
+    access_col = _first_existing_column(
+        lookup_columns,
+        "SSRS_Access_Method",
+        "RPT_Access_Method"
+    )
+
+    # -------------------------------------------------------
+    # STEP 6: Resolve SSRS access method
+    # -------------------------------------------------------
+
+    access_method = get_rpt_access_method(source_database)
+
+    print("Mapped Access Method:", repr(access_method))
+    print("Access Method Column:", repr(access_col))
+
+    # -------------------------------------------------------
+    # STEP 7: Lookup RPT_Folder_ID
+    # -------------------------------------------------------
+
+    if access_col:
+
+        sql = f"""
+            SELECT RPT_Folder_ID
+            FROM {TARGET_RPT_PROGRAM_AREA}
+            WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+              AND UPPER(LTRIM(RTRIM([{access_col}]))) = UPPER(?)
+        """
+
+        cursor.execute(
+            sql,
+            folder_name,
+            access_method
+        )
+
+    else:
+
+        sql = f"""
+            SELECT RPT_Folder_ID
+            FROM {TARGET_RPT_PROGRAM_AREA}
+            WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+        """
+
+        cursor.execute(
+            sql,
+            folder_name
+        )
+
+    # -------------------------------------------------------
+    # STEP 8: Validate lookup result
+    # -------------------------------------------------------
+
+    matches = [
+        row[0]
+        for row in cursor.fetchall()
+    ]
+
+    print("Number of Matches:", len(matches))
+    print("Matching Folder IDs:", matches)
+    print("=============================================\n")
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one folder mapping, found {len(matches)} for "
+            f"RPT_Folder_Name={folder_name!r}, "
+            f"Source_Database={source_database!r}, "
+            f"RPT_ACCESS_METHOD="
+            f"{access_method if access_col else 'not present'!r}, "
+            f"RPT_Path={report_path!r}. "
+            f"Verify dbo.RPT_Program_Area."
+        )
+
+    # -------------------------------------------------------
+    # STEP 9: Return resolved folder ID
+    # -------------------------------------------------------
+
+    rpt_folder_id = matches[0]
+
+    print(
+        f"RESOLVED RPT_Folder_ID: "
+        f"Report={report_path} | "
+        f"Folder={folder_name} | "
+        f"Folder_ID={rpt_folder_id}"
+    )
+
+    return rpt_folder_id
