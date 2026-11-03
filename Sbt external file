@@ -1,0 +1,22 @@
+elif top_folder.strip().upper() in (
+    "SBT EXTERNAL",
+    "SBT EXTERNAL REPORTS"
+):
+
+    print("*** SBT EXTERNAL CONDITION MATCHED ***")
+
+    if len(path_parts) == 2:
+
+        # Root-level report
+        candidates = [path_parts[0]]
+
+    else:
+
+        # Subfolder report
+        # Exclude the last component (report name)
+        candidates = [
+            "/".join(path_parts[:depth])
+            for depth in range(len(path_parts) - 1, 1, -1)
+        ]
+
+    print("SBT EXTERNAL CANDIDATES:", candidates)
