@@ -1,0 +1,31 @@
+# -------------------------------------------------------
+# Determine candidate folders for RPT_Folder_ID lookup
+# -------------------------------------------------------
+
+if top_folder == "BAQA":
+
+    if len(path_parts) < 3:
+        raise ValueError(
+            f"BAQA report requires a subfolder: {report_path!r}"
+        )
+
+    # Example: /BAQA/AUDIT/Report -> BAQA/AUDIT
+    candidates = ["/".join(path_parts[:2])]
+
+elif top_folder in ("SBT EXTERNAL", "SBT EXTERNAL REPORTS"):
+
+    if len(path_parts) == 2:
+        # Report directly under main folder
+        candidates = [path_parts[0]]
+
+    else:
+        # Subfolder reports: deepest registered folder first
+        # Exclude final path component (report name)
+        candidates = [
+            "/".join(path_parts[:depth])
+            for depth in range(len(path_parts) - 1, 1, -1)
+        ]
+
+else:
+    # Existing behavior for all other folders
+    candidates = [path_parts[0]]
