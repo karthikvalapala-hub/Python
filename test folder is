@@ -1,0 +1,242 @@
+def resolve_rpt_folder_id(cursor, report_path, source_database):
+    """
+    Resolve RPT_Folder_ID from RPT_Program_Area.
+
+    Rules:
+    1. BAQA:
+       /BAQA/Alerts/Report -> BAQA/Alerts
+
+    2. SBT EXTERNAL:
+       /SBT EXTERNAL/Report
+           -> SBT EXTERNAL
+
+       /SBT EXTERNAL/AUDIT/Report
+           -> SBT EXTERNAL/AUDIT
+
+       /SBT EXTERNAL/AUDIT/MISSING REPORTING/Report
+           -> SBT EXTERNAL/AUDIT/MISSING REPORTING
+           -> SBT EXTERNAL/AUDIT (if deepest folder is not mapped)
+
+    3. Other folders:
+       /Finance/Revenue/Report -> Finance
+
+    The function never falls back to the SBT EXTERNAL root
+    for reports located inside its subfolders.
+    """
+
+    # -------------------------------------------------------
+    # STEP 1: Validate and normalize report path
+    # -------------------------------------------------------
+
+    if not report_path:
+        raise ValueError(
+            "Cannot resolve RPT_Folder_ID: report path is blank"
+        )
+
+    normalized_path = str(report_path).replace("\\", "/").strip()
+
+    path_parts = [
+        part.strip()
+        for part in normalized_path.split("/")
+        if part.strip()
+    ]
+
+    if len(path_parts) < 2:
+        raise ValueError(
+            f"Invalid SSRS report path: {report_path!r}"
+        )
+
+    # -------------------------------------------------------
+    # STEP 2: Identify top-level folder
+    # -------------------------------------------------------
+
+    top_folder = path_parts[0].upper()
+
+    # -------------------------------------------------------
+    # STEP 3: Identify lookup table columns
+    # -------------------------------------------------------
+
+    lookup_columns = get_table_columns(
+        cursor,
+        TARGET_RPT_PROGRAM_AREA
+    )
+
+    access_col = _first_existing_column(
+        lookup_columns,
+        "SSRS_Access_Method",
+        "RPT_Access_Method"
+    )
+
+    # -------------------------------------------------------
+    # STEP 4: Resolve access method
+    # -------------------------------------------------------
+
+    access_method = get_rpt_access_method(source_database)
+
+    # -------------------------------------------------------
+    # STEP 5: Define folder lookup helper
+    # -------------------------------------------------------
+
+    def lookup_folder(folder_name):
+
+        if access_col:
+
+            sql = f"""
+                SELECT RPT_Folder_ID
+                FROM {TARGET_RPT_PROGRAM_AREA}
+                WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+                  AND UPPER(LTRIM(RTRIM([{access_col}]))) = UPPER(?)
+            """
+
+            cursor.execute(
+                sql,
+                folder_name,
+                access_method
+            )
+
+        else:
+
+            sql = f"""
+                SELECT RPT_Folder_ID
+                FROM {TARGET_RPT_PROGRAM_AREA}
+                WHERE UPPER(LTRIM(RTRIM(RPT_Folder_Name))) = UPPER(?)
+            """
+
+            cursor.execute(
+                sql,
+                folder_name
+            )
+
+        matches = [
+            row[0]
+            for row in cursor.fetchall()
+        ]
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"Duplicate folder mapping found for "
+                f"RPT_Folder_Name={folder_name!r}, "
+                f"Access_Method={access_method!r}, "
+                f"Matches={matches!r}"
+            )
+
+        return matches[0] if matches else None
+
+    # -------------------------------------------------------
+    # STEP 6: Determine candidate folders
+    # -------------------------------------------------------
+
+    # Always initialize candidates before using it.
+    candidates = []
+
+    if top_folder == "BAQA":
+
+        if len(path_parts) < 3:
+            raise ValueError(
+                f"BAQA report requires a subfolder: "
+                f"{report_path!r}"
+            )
+
+        # Example:
+        # /BAQA/Alerts/Report -> BAQA/Alerts
+
+        candidates = [
+            "/".join(path_parts[:2])
+        ]
+
+    elif top_folder in (
+        "SBT EXTERNAL",
+        "SBT EXTERNAL REPORTS"
+    ):
+
+        if len(path_parts) == 2:
+
+            # Root-level report:
+            # /SBT EXTERNAL/Report
+            # -> SBT EXTERNAL
+
+            candidates = [
+                path_parts[0]
+            ]
+
+        else:
+
+            # Subfolder reports:
+            # /SBT EXTERNAL/AUDIT/Report
+            # -> SBT EXTERNAL/AUDIT
+            #
+            # /SBT EXTERNAL/AUDIT/MISSING REPORTING/Report
+            # -> SBT EXTERNAL/AUDIT/MISSING REPORTING
+            # -> SBT EXTERNAL/AUDIT
+            #
+            # Exclude the last component (report name).
+
+            candidates = [
+                "/".join(path_parts[:depth])
+                for depth in range(
+                    len(path_parts) - 1,
+                    1,
+                    -1
+                )
+            ]
+
+    else:
+
+        # Existing behavior for all other folders.
+        # /Finance/Revenue/Report -> Finance
+
+        candidates = [
+            path_parts[0]
+        ]
+
+    # -------------------------------------------------------
+    # STEP 7: Debug candidate folder selection
+    # -------------------------------------------------------
+
+    print("\n========== FOLDER RESOLUTION DEBUG ==========")
+    print("Report Path:", repr(report_path))
+    print("Path Parts:", path_parts)
+    print("Top Folder:", repr(top_folder))
+    print("Candidate Folders:", candidates)
+    print("Source Database:", repr(source_database))
+    print("Mapped Access Method:", repr(access_method))
+    print("Access Method Column:", repr(access_col))
+
+    # -------------------------------------------------------
+    # STEP 8: Resolve RPT_Folder_ID
+    # -------------------------------------------------------
+
+    for folder_name in candidates:
+
+        folder_id = lookup_folder(folder_name)
+
+        print(
+            f"Checking Folder={folder_name!r}, "
+            f"Found ID={folder_id!r}"
+        )
+
+        if folder_id is not None:
+
+            print(
+                f"RESOLVED RPT_Folder_ID: "
+                f"Report={report_path} | "
+                f"Folder={folder_name} | "
+                f"Folder_ID={folder_id}"
+            )
+
+            print("=============================================\n")
+
+            return folder_id
+
+    # -------------------------------------------------------
+    # STEP 9: Raise error if no matching folder found
+    # -------------------------------------------------------
+
+    raise ValueError(
+        f"No matching RPT_Folder_ID found for "
+        f"RPT_Path={report_path!r}, "
+        f"Candidate_Folders={candidates!r}, "
+        f"Source_Database={source_database!r}, "
+        f"Access_Method={access_method!r}. "
+        f"Verify {TARGET_RPT_PROGRAM_AREA}."
+    )
